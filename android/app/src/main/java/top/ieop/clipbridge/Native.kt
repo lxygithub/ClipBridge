@@ -24,8 +24,14 @@ object Native {
     external fun nativeAckedSeq(): Long
 }
 
-/** Rust 侧通过 JNI 回调这两个方法，方法名与签名必须保持一致。 */
+/** Rust 侧通过 JNI 回调这些方法，方法名与签名必须保持一致。 */
 interface BridgeListener {
     fun onClipText(seq: Long, text: String)
     fun onState(state: String)
+
+    /** 文件落地完成（当前落在 app 私有目录 inbox/ 下）。 */
+    fun onFile(name: String, path: String, size: Long) {}
+
+    /** 文件接收进度，用于进度通知。 */
+    fun onFileProgress(name: String, done: Long, total: Long) {}
 }

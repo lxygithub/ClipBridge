@@ -71,6 +71,17 @@ class SyncService : Service(), BridgeListener {
         Notifier.updateService(this, state)
     }
 
+    override fun onFile(name: String, path: String, size: Long) {
+        BridgeState.push(
+            ClipItem(seq = 0, text = "文件 · $name", ts = System.currentTimeMillis())
+        )
+        Notifier.showFile(this, name, size)
+    }
+
+    override fun onFileProgress(name: String, done: Long, total: Long) {
+        Notifier.updateFileProgress(this, name, done, total)
+    }
+
     override fun onDestroy() {
         Native.nativeStop()
         started = false

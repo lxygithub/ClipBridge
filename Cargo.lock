@@ -395,6 +395,8 @@ dependencies = [
  "clipbridge-core",
  "iroh",
  "jni 0.21.1",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

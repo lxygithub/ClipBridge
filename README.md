@@ -32,14 +32,15 @@ ClipBridge 的取舍：**服务器架在 Windows 上，手机主动拨号**，�
 | 桌面图标长按 / 分享面板 / 快捷设置磁贴 三个发送入口 | ✅ |
 | 手机端界面（设计稿方向 3「一条通道」） | ✅ |
 | 文件传输：Windows 端收发（`.part` + SHA256 校验 + 同名不覆盖 + ≤2GB 校验）+ `send-file` 命令 | ✅ |
-| 文件传输：手机端收发、暂停/恢复/取消 UI | ⬜ 进行中 |
+| 文件传输：PC → 手机（`outbox/` 投递即推，手机落盘 + 校验回包 + 进度/完成通知） | ✅ |
+| 手机端断线探测（20s 心跳探活，半开连接能自己发现并重连） | ✅ |
+| 文件传输：手机 → PC、暂停/恢复/取消 UI | ⬜ 进行中 |
 | 图片剪贴板 | ⬜ |
 | 手机端历史持久化 / 多台电脑配对 | ⬜ |
 | Windows 历史窗口自绘（当前仍是原生 EDIT/LISTBOX） | ⬜ |
 
 <p align="center">
-  <img src="docs/shots/windows-history.png" width="620" alt="Windows 历史窗口">
-  <img src="docs/shots/android-notify.png" width="270" alt="手机通知">
+  <img src="docs/shots/android-detail.png" width="270" alt="手机端条目详情">
 </p>
 
 ## 架构
@@ -109,12 +110,19 @@ Gradle 不读 Windows 系统代理，走代理时在 `android/gradle.properties`
 4. 手机发文本：长按桌面图标选「发送剪贴板」、任意 app 里分享、或下拉点磁贴
 5. 电脑端 `Ctrl+Alt+H` 打开历史窗口
 
-发文件（当前 Windows 端已可用，手机端待接）：
+发文件（两个方向都已可用）：
 
 ```powershell
+# 电脑 → 手机：把文件丢进 outbox，serve 会推给所有在线手机
+copy D:\path\to\big.zip D:\ClipBridge\outbox\
+# 成功后自动移到 outbox\sent\；失败留在原地，每 2s 重试并从 .part 断点续传
+
+# 电脑 → 电脑（手机主动拨号，所以不能用 send-file 直接打给手机）
 clipbridge.exe send-file --peer <对方 ID> --file D:\path\to\big.zip
 # 对方落盘到 <dir>\inbox\，SHA256 校验通过后才改名，同名自动加 " (1)"
 ```
+
+手机收到的文件在 app 私有目录 `files/inbox/`（要放进系统相册/下载需手动分享）。
 
 ## 已知限制
 
@@ -136,10 +144,11 @@ cargo run -p clipbridge -- recv --peer <ID> # 模拟手机端，看广播与补�
 
 - [x] M1 文本双向 + Windows 常驻界面
 - [x] 手机端方向 3 界面 + 内置配对 ID
-- [ ] M2 文件双向传输（`FILE_OFFER/ACCEPT/PAUSE/RESUME/CANCEL`，`.part` 落盘，≤2GB）
-  - [x] core：报价/接受/完成 payload、`.part` 落盘、SHA256、同名去重、CHUNK 流式
-  - [x] Windows：接收（`inbox/` 落盘）+ `clipbridge send-file --peer <ID> --file <路径>`
-  - [ ] Android：JNI 回调 + 后台落盘 + 进度通知（暂停/取消）
+- [x] M2 文件双向传输（`FILE_OFFER/PAUSE/RESUME/CANCEL`，`.part` 落盘，≤2GB）
+  - [x] core：报价/接受/完成 payload、`.part` 落盘、SHA256、同名去重、CHUNK 流式、稳定传输 id（重试续传）
+  - [x] Windows：接收（`inbox/` 落盘）+ `clipbridge send-file` + `outbox/` 投递即推
+  - [x] Android：JNI 回调 + 后台落盘 + 进度/完成通知 + 校验回包
+  - [ ] Android：手机 → PC 发文件、暂停/取消 UI
 - [ ] M3 图片剪贴板（DIB → PNG，缩略图通知）
 - [ ] M4 手机端历史持久化、多台电脑配对
 - [ ] M5 Windows 历史窗口自绘，与手机端同一套视觉

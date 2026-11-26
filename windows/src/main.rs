@@ -196,6 +196,13 @@ async fn serve_net(
     let pending: Pendings = Arc::new(Mutex::new(HashMap::new()));
     let inbox = dir.join("inbox");
     let _ = std::fs::create_dir_all(&inbox);
+    let outbox = dir.join("outbox");
+    let _ = std::fs::create_dir_all(&outbox);
+    tokio::spawn(watch_outbox(
+        Arc::clone(&peers),
+        outbox.clone(),
+        outbox.join("sent"),
+    ));
 
     println!("=== clipbridge serve ===");
     net::print_endpoint_info(&ep);
@@ -408,6 +415,10 @@ async fn handle_conn(
                         println!("[file] canceled {}", &id);
                     }
                 }
+                protocol::MSG_PING => {
+                    let _ = protocol::write_frame(&mut send, protocol::MSG_PING, b"").await;
+                    let _ = send.finish();
+                }
                 other => eprintln!("[conn] unsupported type {other:#04x}"),
             }
         });
@@ -514,14 +525,11 @@ fn mime_of(path: &Path) -> String {
     .to_string()
 }
 
-/// 一次性发文件：OFFER → ACCEPT → 数据流 → 等 COMPLETE。
-async fn send_file(
-    secret: iroh::SecretKey,
-    peer: &str,
-    relay: &str,
-    path: PathBuf,
-) -> Result<()> {
-    let meta = std::fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+/// 在一条已有连接上推一个文件：OFFER → ACCEPT → 数据流 → 等 COMPLETE。
+///
+/// 既被 CLI 用（自己拨号），也被 `outbox` 监视用（复用手机拨进来的那条连接）。
+async fn push_file(conn: &Connection, path: &Path) -> Result<()> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     anyhow::ensure!(meta.is_file(), "not a file");
     let size = meta.len();
     anyhow::ensure!(size > 0, "empty file");
@@ -534,20 +542,19 @@ async fn send_file(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
-    let id = transfer::new_id(&path.display().to_string());
-    let sha = transfer::sha256_file(&path)?;
+    let id = transfer::new_id(&path.display().to_string(), size);
+    let sha = {
+        let p = path.to_path_buf();
+        tokio::task::spawn_blocking(move || transfer::sha256_file(&p)).await??
+    };
 
     let offer = transfer::Offer {
         id: id.clone(),
-        name,
+        name: name.clone(),
         size,
         sha256: sha.clone(),
-        mime: mime_of(&path),
+        mime: mime_of(path),
     };
-
-    let addr = net::parse_peer(peer, relay)?;
-    let ep = net::build_endpoint(secret).await?;
-    let conn = ep.connect(addr, ALPN).await.context("connect failed")?;
 
     // 1) 报价
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await.context("open control stream")?;
@@ -564,12 +571,14 @@ async fn send_file(
     let Some((ty, payload)) = reply else {
         anyhow::bail!("peer closed before accepting");
     };
+    let mut start_at = 0u64;
     match ty {
         protocol::MSG_FILE_ACCEPT => {
             let accept: transfer::Accept = serde_json::from_slice(&payload)?;
+            start_at = accept.offset.min(size);
             println!(
                 "✓ 对方已接受（{}，{} bytes，从 {} 续传）",
-                offer.name, offer.size, accept.offset
+                offer.name, offer.size, start_at
             );
         }
         protocol::MSG_FILE_REJECT => {
@@ -582,10 +591,10 @@ async fn send_file(
     let flags = transfer::TransferFlags::new();
     let (mut send, _recv) = conn.open_bi().await.context("open data stream")?;
     protocol::write_frame(&mut send, protocol::MSG_FILE_DATA, id.as_bytes()).await?;
-    let outcome = transfer::send_stream(&mut send, &path, 0, &flags).await?;
+    let outcome = transfer::send_stream(&mut send, path, start_at, &flags).await?;
     println!("→ 发送结果 {:?}", outcome);
 
-    // 3) 等对端校验结果
+    // 3) 等对端校验结果（3s 内没回包不算失败，对端可能只是慢）
     match tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await {
         Ok(Ok((_s, mut r))) => {
             if let Ok(Some((protocol::MSG_FILE_COMPLETE, payload))) = protocol::read_frame(&mut r).await
@@ -598,15 +607,67 @@ async fn send_file(
                     done.size,
                     &done.sha256[..8.min(done.sha256.len())]
                 );
+                anyhow::ensure!(done.ok, "peer reported failure");
             }
         }
         _ => println!("⚠ 没等到对端 COMPLETE（可能已落盘但回包丢了）"),
     }
+    Ok(())
+}
 
+/// 一次性发文件：自己拨号到对端，再走 [push_file]。
+async fn send_file(
+    secret: iroh::SecretKey,
+    peer: &str,
+    relay: &str,
+    path: PathBuf,
+) -> Result<()> {
+    let addr = net::parse_peer(peer, relay)?;
+    let ep = net::build_endpoint(secret).await?;
+    let conn = ep.connect(addr, ALPN).await.context("connect failed")?;
+    push_file(&conn, &path).await?;
     conn.close(0u32.into(), b"done");
     ep.close().await;
     Ok(())
 }
+
+/// `outbox/` 监视：放进去的文件会被推给所有在线设备，成功后移到 `outbox/sent/`。
+///
+/// 手机是被动方（它主动拨号过来），所以 PC → 手机的文件只能复用这条已建好的连接。
+async fn watch_outbox(peers: Peers, outbox: PathBuf, sent: PathBuf) {
+    let _ = std::fs::create_dir_all(&sent);
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let entries = match std::fs::read_dir(&outbox) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let conns: Vec<Connection> = peers.lock().await.values().cloned().collect();
+            if conns.is_empty() {
+                continue;
+            }
+            let mut all_ok = true;
+            for conn in conns {
+                if let Err(err) = push_file(&conn, &path).await {
+                    eprintln!("[outbox] {err:#}");
+                    all_ok = false;
+                }
+            }
+            if all_ok {
+                if let Some(name) = path.file_name() {
+                    let _ = std::fs::rename(&path, sent.join(name));
+                }
+                println!("[outbox] sent {}", path.display());
+            }
+        }
+    }
+}
+
 
 /// 调试用接收端：模拟手机，验证广播与补发链路。
 async fn recv(secret: iroh::SecretKey, peer: &str, relay: &str) -> Result<()> {
@@ -639,3 +700,4 @@ async fn recv(secret: iroh::SecretKey, peer: &str, relay: &str) -> Result<()> {
     }
     Ok(())
 }
+

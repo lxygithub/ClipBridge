@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clipbridge_core::{net, protocol, ALPN};
+use clipbridge_core::{net, protocol, transfer, ALPN};
 use iroh::endpoint::Connection;
 use iroh::Endpoint;
 use jni::objects::{GlobalRef, JObject, JString, JValue};
@@ -46,6 +46,8 @@ struct Session {
     peer: String,
     relay: String,
     acked: AtomicU64,
+    /// 已报价、等待数据流的文件：id → (offer, .part 路径)
+    pending: Mutex<std::collections::HashMap<String, (transfer::Offer, PathBuf)>>,
 }
 
 impl Session {
@@ -72,6 +74,42 @@ impl Session {
             "onClipText",
             "(JLjava/lang/String;)V",
             &[JValue::Long(seq as jlong), JValue::Object(&JObject::from(obj))],
+        );
+    }
+
+    fn notify_file(&self, name: &str, path: &str, size: u64) {
+        let Ok(mut env) = self.vm.attach_current_thread() else {
+            return;
+        };
+        let (Ok(n), Ok(p)) = (env.new_string(name), env.new_string(path)) else {
+            return;
+        };
+        let _ = env.call_method(
+            self.cb.as_obj(),
+            "onFile",
+            "(Ljava/lang/String;Ljava/lang/String;J)V",
+            &[
+                JValue::Object(&JObject::from(n)),
+                JValue::Object(&JObject::from(p)),
+                JValue::Long(size as jlong),
+            ],
+        );
+    }
+
+    fn notify_progress(&self, name: &str, done: u64, total: u64) {
+        let Ok(mut env) = self.vm.attach_current_thread() else {
+            return;
+        };
+        let Ok(n) = env.new_string(name) else { return };
+        let _ = env.call_method(
+            self.cb.as_obj(),
+            "onFileProgress",
+            "(Ljava/lang/String;JJ)V",
+            &[
+                JValue::Object(&JObject::from(n)),
+                JValue::Long(done as jlong),
+                JValue::Long(total as jlong),
+            ],
         );
     }
 
@@ -103,8 +141,33 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
     }
     sess.state("connected");
 
+    // 每 15s 探一次活：半开连接上 accept_bi 会一直挂住，只有主动写才能发现断线
+    let mut hb = tokio::time::interval(std::time::Duration::from_secs(20));
     loop {
-        let (mut send, mut recv) = match conn.accept_bi().await {
+        let pair = tokio::select! {
+            _ = hb.tick() => {
+                let probe = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let (mut s, _r) = conn.open_bi().await?;
+                    protocol::write_frame(&mut s, protocol::MSG_PING, b"").await?;
+                    s.finish().ok();
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await;
+                match &probe {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => eprintln!("[jni] heartbeat error: {err:#}"),
+                    Err(_) => eprintln!("[jni] heartbeat timeout"),
+                }
+                if !matches!(probe, Ok(Ok(()))) {
+                    eprintln!("[jni] heartbeat failed, dropping conn");
+                    conn.close(0u32.into(), b"stale");
+                    break;
+                }
+                continue;
+            }
+            pair = conn.accept_bi() => pair,
+        };
+        let (mut send, mut recv) = match pair {
             Ok(pair) => pair,
             Err(_) => break,
         };
@@ -128,6 +191,92 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                 protocol::MSG_PING => {
                     let _ = protocol::write_frame(&mut send, protocol::MSG_PING, b"").await;
                     let _ = send.finish();
+                }
+                protocol::MSG_FILE_OFFER => match serde_json::from_slice::<transfer::Offer>(&payload) {
+                    Ok(offer) => {
+                        let name = transfer::safe_name(&offer.name);
+                        if offer.size == 0 || offer.size > transfer::MAX_FILE_SIZE {
+                            eprintln!("[jni] reject file: bad size {}", offer.size);
+                            return;
+                        }
+                        let inbox = sess.dir.join("inbox");
+                        let _ = std::fs::create_dir_all(&inbox);
+                        let part = inbox.join(format!("{}.part", offer.id));
+                        let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                        sess.pending
+                            .lock()
+                            .unwrap()
+                            .insert(offer.id.clone(), (offer.clone(), part));
+                        let accept = transfer::Accept {
+                            id: offer.id.clone(),
+                            offset: have,
+                        };
+                        if let Ok(json) = serde_json::to_vec(&accept) {
+                            let _ = protocol::write_frame(&mut send, protocol::MSG_FILE_ACCEPT, &json).await;
+                        }
+                        let _ = send.finish();
+                        eprintln!(
+                            "[jni] accepting file {} ({} bytes, from {})",
+                            name, offer.size, accept.offset
+                        );
+                    }
+                    Err(err) => eprintln!("[jni] bad offer: {err:#}"),
+                },
+                protocol::MSG_FILE_DATA => {
+                    let id = String::from_utf8_lossy(&payload).trim().to_string();
+                    let Some((offer, part)) = sess.pending.lock().unwrap().remove(&id) else {
+                        eprintln!("[jni] data for unknown id {id}");
+                        return;
+                    };
+                    let flags = transfer::TransferFlags::new();
+                    let name = transfer::safe_name(&offer.name);
+                    let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                    sess.notify_progress(&name, have, offer.size);
+                    let received = match transfer::recv_stream(&mut recv, &part, have, &flags, offer.size).await {
+                        Ok(n) => n,
+                        Err(err) => {
+                            eprintln!("[jni] recv failed: {err:#}");
+                            return;
+                        }
+                    };
+                    let digest = transfer::sha256_file(&part).unwrap_or_default();
+                    if received != offer.size
+                        || (!offer.sha256.is_empty() && !digest.eq_ignore_ascii_case(&offer.sha256))
+                    {
+                        eprintln!("[jni] file incomplete/mismatch, part kept {}", part.display());
+                        return;
+                    }
+                    let final_path = transfer::unique_path(&sess.dir.join("inbox"), &name);
+                    if let Err(err) = std::fs::rename(&part, &final_path) {
+                        eprintln!("[jni] rename failed: {err:#}");
+                        return;
+                    }
+                    let path_text = final_path.display().to_string();
+                    sess.notify_file(&name, &path_text, received);
+                    eprintln!("[jni] file saved {path_text}");
+
+                    // 回 COMPLETE：PC 侧靠这条新流确认校验通过
+                    let done = transfer::Complete {
+                        id: id.clone(),
+                        ok: true,
+                        sha256: digest.clone(),
+                        size: received,
+                    };
+                    let conn = sess.conn.lock().unwrap().clone();
+                    if let Some(conn) = conn {
+                        if let Ok((mut s, _r)) = conn.open_bi().await {
+                            if let Ok(json) = serde_json::to_vec(&done) {
+                                let _ = protocol::write_frame(&mut s, protocol::MSG_FILE_COMPLETE, &json).await;
+                            }
+                            let _ = s.finish();
+                        }
+                    }
+                }
+                protocol::MSG_FILE_CANCEL => {
+                    let id = String::from_utf8_lossy(&payload).trim().to_string();
+                    if let Some((_, part)) = sess.pending.lock().unwrap().remove(&id) {
+                        let _ = std::fs::remove_file(part);
+                    }
                 }
                 other => eprintln!("[jni] unsupported frame {other:#04x}"),
             }
@@ -266,6 +415,7 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
         peer: peer_s,
         relay: relay_s,
         acked: AtomicU64::new(read_last_seq(&dir_path)),
+        pending: Mutex::new(std::collections::HashMap::new()),
     });
 
     *slot().lock().unwrap() = Some(Arc::clone(&sess));
@@ -347,3 +497,5 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeAckedSeq(
         .map(|s| s.acked.load(Ordering::Relaxed) as jlong)
         .unwrap_or(0)
 }
+
+

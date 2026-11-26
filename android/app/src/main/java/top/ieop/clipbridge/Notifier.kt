@@ -18,6 +18,7 @@ object Notifier {
     const val CH_FILE = "clip_file"
     const val CH_SERVICE = "service_alive"
     const val FG_ID = 1
+    const val FILE_ID = 2
 
     private const val TAG_TEXT = "clip_text"
 
@@ -73,6 +74,41 @@ object Notifier {
             .notify(10_000 + (seq % 500).toInt(), n)
     }
 
+    /** 文件到达：进度通知（LOW），完成后改成「已保存」。 */
+    fun updateFileProgress(ctx: Context, name: String, done: Long, total: Long) {
+        val pct = if (total > 0) (done * 100 / total).toInt() else 0
+        val open = PendingIntent.getActivity(
+            ctx, 2,
+            Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val n = Notification.Builder(ctx, CH_FILE)
+            .setSmallIcon(R.drawable.ic_shortcut_file)
+            .setContentTitle("接收文件 · $name")
+            .setContentText("$pct% · ${human(done)} / ${human(total)}")
+            .setProgress(100, pct, total <= 0)
+            .setContentIntent(open)
+            .setOngoing(true)
+            .build()
+        ctx.getSystemService(NotificationManager::class.java).notify(FILE_ID, n)
+    }
+
+    fun showFile(ctx: Context, name: String, size: Long) {
+        val open = PendingIntent.getActivity(
+            ctx, 2,
+            Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val n = Notification.Builder(ctx, CH_FILE)
+            .setSmallIcon(R.drawable.ic_shortcut_file)
+            .setContentTitle("文件已保存 · $name")
+            .setContentText(human(size) + " · 在应用内查看路径")
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        ctx.getSystemService(NotificationManager::class.java).notify(FILE_ID, n)
+    }
+
     /** 常驻通知：显示连接状态。 */
     fun serviceNotification(ctx: Context, state: String = "启动中"): Notification {
         val open = PendingIntent.getActivity(
@@ -100,5 +136,13 @@ object Notifier {
         state == "disconnected" -> "未连接（自动重试中）"
         state.startsWith("error") -> "连接异常：${state.removePrefix("error:")}"
         else -> state
+    }
+
+    /** 1.2 MB / 340 KB 这类可读体积。 */
+    fun human(bytes: Long): String = when {
+        bytes >= 1024L * 1024 * 1024 -> String.format("%.2f GB", bytes / 1024.0 / 1024 / 1024)
+        bytes >= 1024L * 1024 -> String.format("%.1f MB", bytes / 1024.0 / 1024)
+        bytes >= 1024 -> String.format("%.0f KB", bytes / 1024.0)
+        else -> "$bytes B"
     }
 }

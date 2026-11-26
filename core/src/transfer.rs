@@ -114,15 +114,14 @@ pub enum SendOutcome {
 /// 生成 transfer id：时间戳 + pid + 目标路径做 SHA256，取前 16 字节。
 ///
 /// 不引入 rand 依赖：这里的 id 只用于本次会话内配对，不需要密码学随机。
-pub fn new_id(seed: &str) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+/// 传输 id：由「源路径 + 大小」稳定生成。
+///
+/// 故意不含时间戳/进程 id —— 同一个文件重试时 id 不变，接收端才能认出旧 `.part`
+/// 并从断点续传（`Accept.offset` 才有意义）。
+pub fn new_id(seed: &str, size: u64) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(now.to_le_bytes());
     hasher.update(seed.as_bytes());
-    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(size.to_le_bytes());
     let digest = hasher.finalize();
     hex16(&digest[..16])
 }
@@ -162,7 +161,7 @@ pub fn safe_name(raw: &str) -> String {
         .collect::<String>();
     let trimmed = name.trim().trim_matches('.').to_string();
     if trimmed.is_empty() {
-        format!("file-{}", new_id("unnamed"))
+        format!("file-{}", new_id("unnamed", 0))
     } else {
         trimmed
     }

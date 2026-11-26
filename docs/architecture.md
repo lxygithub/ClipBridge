@@ -185,6 +185,8 @@ ALPN：`clipbridge/1`
 - 单文件 ≤ 2GB，`FILE_OFFER` 阶段校验，超限直接 `REJECT`
 - 每个文件 SHA256 校验，失败重试一次
 - 多设备时 `seq` 全局单调，`ACK` 按设备粒度假推进
+- 传输 id 由「源路径 + 大小」稳定派生（不含时间戳/pid），同一文件重试时 id 不变，接收端才能凭旧 `.part` 续传
+- PC → 手机的文件不靠 PC 主动拨号（手机是拨号方），复用 serve 手上的既有连接推送；入口是 `D:\ClipBridge\outbox` 目录（放进去即推，成功后移到 `outbox\sent`，失败留在原地下轮重试并续传）
 
 ### 5.3 文件传输状态机
 
@@ -428,11 +430,11 @@ class ClipTileService : TileService() {
 
 | 机制 | 说明 |
 |---|---|
-| 心跳 | QUIC `keep_alive_interval` 30s；空闲断开阈值 120s |
+| 心跳 | 手机每 20s 开一条新流发 `PING`（10s 超时）；半开连接上只 `accept_bi` 是发现不了断线的，必须主动写。PC 收到 `PING` 原样回 `PING` 并 `finish` |
 | 网络切换 | `ConnectivityManager.NetworkCallback` → 立即重建连接 |
 | 重连退避 | 1s → 2s → 4s … 上限 30s |
 | Doze 兜底 | `WorkManager` 15min 周期探活（省电模式主路径） |
-| 传输韧性 | 断线后 `transfers` 保留 offset，重连自动续传 |
+| 传输韧性 | 传输 id 与源文件绑定，断线重连后 `Accept.offset` 从 `.part` 实际长度续传；outbox 每 2s 重试，文件在传完前不离开 outbox |
 | 用户引导 | 自启动、电池优化白名单、后台锁定、允许后台弹窗 |
 | Windows 侧 | endpoint 常驻；异常退出由托盘守护/开机自启恢复 |
 
