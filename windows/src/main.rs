@@ -55,8 +55,8 @@ enum Cmd {
         /// 不建托盘/窗口（自动化测试用）
         #[arg(long)]
         headless: bool,
-        /// 钉死 relay（如 https://aps1-1.relay.n0.iroh.link/）；留空用官方默认地图自动选
-        #[arg(long, default_value = "")]
+        /// 钉死 relay；传空串 `--relay ""` 则交回官方默认地图自动选
+        #[arg(long, default_value = clipbridge_core::net::DEFAULT_RELAY)]
         relay: String,
     },
     /// 向对端发送一段文本

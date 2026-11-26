@@ -42,8 +42,10 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
 /// 用 `N0` 而不是 `Minimal` 是为了「只凭 EndpointId 就能连」：
 /// relay 区域会随网络变化（实测拿到过 euc1 与 usw1），把 relay URL 写死在配置里迟早对不上，
 /// 交给发现服务解析对端当前的家庭 relay 更可靠。
+pub const DEFAULT_RELAY: &str = "https://aps1-1.relay.n0.iroh.link/";
+
 pub async fn build_endpoint(secret: SecretKey) -> Result<Endpoint> {
-    build_endpoint_with_relay(secret, "").await
+    build_endpoint_with_relay(secret, DEFAULT_RELAY).await
 }
 
 /// 同 [build_endpoint]，但可以钉死一个 relay（空串 = 官方默认地图，自动选最近）。
