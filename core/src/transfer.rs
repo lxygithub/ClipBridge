@@ -246,7 +246,14 @@ pub async fn recv_stream(
         tokio::fs::File::create(part).await.context("create part")?
     };
     if offset > 0 {
-        file.seek(SeekFrom::End(0)).await.context("seek part")?;
+        // 关键：对齐到 offset，而不是简单 append 到文件末尾。
+        // 上一条流可能写超了（对端算的 offset 偏小 / 同一 id 被两次投递），
+        // 末尾对齐会导致重复字节、落盘尺寸比源文件大。
+        let cur = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        if cur > offset {
+            file.set_len(offset).await.context("truncate part")?;
+        }
+        file.seek(SeekFrom::Start(offset)).await.context("seek part")?;
     }
 
     let mut written = offset;

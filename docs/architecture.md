@@ -430,11 +430,17 @@ class ClipTileService : TileService() {
 
 | 机制 | 说明 |
 |---|---|
-| 心跳 | 手机每 20s 开一条新流发 `PING`（10s 超时）；半开连接上只 `accept_bi` 是发现不了断线的，必须主动写。PC 收到 `PING` 原样回 `PING` 并 `finish` |
+| QUIC 保活 | 端点上挂 `QuicTransportConfig`：`keep_alive_interval` / `default_path_keep_alive_interval` = 3s，连接级 `max_idle_timeout` = 60s。relay 路径默认 30s idle，跨网抖动一下就整条断，这是 `connection lost: timed out` 的主因之一 |
+| 心跳（应用层） | 手机每 20s 开一条新流发 `PING`（10s 超时）；半开连接上只 `accept_bi` 是发现不了断线的，必须主动写。PC 收到 `PING` 原样回 `PING` 并 `finish`。**只用于反映状态，不再主动 `conn.close`**（连续 10 次失败才把 UI 状态标 stale）；正在收发文件时跳过探活 |
+| relay 可钉 | `--relay`（Windows）/ 手机设置里的 relay 字段；留空用官方默认地图自动选。默认建议 `https://aps1-1.relay.n0.iroh.link/`（亚太） |
 | 网络切换 | `ConnectivityManager.NetworkCallback` → 立即重建连接 |
 | 重连退避 | 1s → 2s → 4s … 上限 30s |
 | Doze 兜底 | `WorkManager` 15min 周期探活（省电模式主路径） |
-| 传输韧性 | 传输 id 与源文件绑定，断线重连后 `Accept.offset` 从 `.part` 实际长度续传；outbox 每 2s 重试，文件在传完前不离开 outbox |
+| 传输韧性 | 传输 id 与源文件绑定，断线重连后 `Accept.offset` 从 `.part` 实际长度续传；outbox 每 2s 重试，**没收到 `COMPLETE` 就留在 outbox 重试**（早先超时当成功，会把没传完的文件挪进 `sent/` 再也不重试） |
+| 续传对齐 | 续传时把 `.part` `set_len` 到 `Accept.offset` 再写，不是简单 append；否则上一轮写超的尾巴会变成重复字节，落盘文件比源文件还大 |
+| 单写者 | 手机侧同一时刻只允许一条写入流；发送端超时重开会重开一条数据流，两条同时追加会把 `.part` 写坏 |
+| 取消 | PC：删掉 `outbox/` 里的源文件 → 本地踩刹车 **并**给对端发 `FILE_CANCEL`；手机：通知上的「取消」→ `nativeCancelTransfer` → 删 `.part` 并回 `FILE_CANCEL` |
+| 路径诊断 | 传输期间每 3s 打 `[path]`：选中路径是 `relay(...)` 还是 `direct(...)`、RTT、cwnd、MTU、累计发送字节、丢包、进度。区分「relay 带宽不够」和「打洞没成」只看这一行 |
 | 用户引导 | 自启动、电池优化白名单、后台锁定、允许后台弹窗 |
 | Windows 侧 | endpoint 常驻；异常退出由托盘守护/开机自启恢复 |
 
@@ -513,12 +519,13 @@ class ClipTileService : TileService() {
 | 后台写剪贴板被 ROM 拦截 | 通知按钮失效 | `NoDisplay` Activity 兜底 |
 | 历史全量保留 | 磁盘无限增长 | 显示占用 + 一键清理 30 天前 |
 | 2GB 文件 + 手机端后台被杀 | 传输中断 | offset 持久化，重连自动续传 |
+| 官方 relay 带宽/拥塞（**实测已发生**） | 北京 ↔ 手机走 `euc1`/`aps1` 只有 25–70 KB/s，RTT 从 600ms 涨到 20s+，大文件靠多轮续传才堆完 | 已加 QUIC 保活/长 idle、relay 可钉、单写者与 offset 对齐；根治要靠①同网直连（打洞成功）或②自建 relay（原 M7 提前评估） |
 
 ---
 
 ## 15. 明确不做的扩展
 
-- 自建 relay：官方 relay 已满足需求，除非官方不可用再评估（原 M7 保留为可选项）
+- 自建 relay：**默认不做**，官方 relay 够用；但官方 relay 在跨网大文件上实测只有几十 KB/s（见第 14 节），所以保留 `--relay` 开关，将来需要时换自建节点不用改代码
 - 厂商推送：资质门槛 + 内容过第三方
 - iOS 端、跨平台 Web 端
 - 传输限速、断点加密分片等进阶特性

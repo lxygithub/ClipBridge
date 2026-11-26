@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::presets;
+use iroh::endpoint::{IdleTimeout, QuicTransportConfig};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
 use crate::ALPN;
@@ -42,19 +43,48 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
 /// relay 区域会随网络变化（实测拿到过 euc1 与 usw1），把 relay URL 写死在配置里迟早对不上，
 /// 交给发现服务解析对端当前的家庭 relay 更可靠。
 pub async fn build_endpoint(secret: SecretKey) -> Result<Endpoint> {
-    let ep = Endpoint::builder(presets::N0)
+    build_endpoint_with_relay(secret, "").await
+}
+
+/// 同 [build_endpoint]，但可以钉死一个 relay（空串 = 官方默认地图，自动选最近）。
+///
+/// 为什么要钉：默认地图里节点会自己挑，北京实测挑到了 euc1（法兰克福），
+/// 传大文件只有 70KB/s 还老被 idle 超时掐断。钉到 aps1（新加坡）能少一半 RTT。
+pub async fn build_endpoint_with_relay(secret: SecretKey, relay_url: &str) -> Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .relay_mode(RelayMode::Default)
         .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-        .context("bind endpoint")?;
+        // QUIC 层：链路烂的时候别急着判死
+        // - keep_alive 3s：一条 PING 只要 3s 没发就会补，relay 路径不会因为静默被判 30s idle
+        // - 连接级 idle 60s：默认 30s，跨网抖动一下就断
+        // - 路径级 idle 15s 是 iroh 上限（再大也会被 clamp），保持默认
+        .transport_config(transport_config());
+
+    if relay_url.is_empty() {
+        builder = builder.relay_mode(RelayMode::Default);
+    } else {
+        let url = RelayUrl::from_str(relay_url).context("invalid relay url")?;
+        builder = builder.relay_mode(RelayMode::custom([url]));
+    }
+
+    let ep = builder.bind().await.context("bind endpoint")?;
 
     let online = tokio::time::timeout(Duration::from_secs(8), ep.online()).await;
     if online.is_err() {
         eprintln!("[endpoint] warning: not online within 8s, relay may be unreachable");
     }
     Ok(ep)
+}
+
+/// 传输层的 QUIC 参数：都是「链路差的时候别自己判死」的取向。
+fn transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .keep_alive_interval(Duration::from_secs(3))
+        .default_path_keep_alive_interval(Duration::from_secs(3))
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(Duration::from_secs(60)).unwrap_or_default(),
+        ))
+        .build()
 }
 
 /// 解析命令行给的 `peer_id` + `relay_url`。relay 可为空（只依赖直连地址）。

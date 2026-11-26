@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand};
 use clipbridge_core::{net, protocol, transfer, ALPN, DEFAULT_DIR};
 use iroh::endpoint::Connection;
 use iroh::EndpointId;
+use iroh::TransportAddr;
 use std::path::Path;
 use std::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
@@ -54,6 +55,9 @@ enum Cmd {
         /// 不建托盘/窗口（自动化测试用）
         #[arg(long)]
         headless: bool,
+        /// 钉死 relay（如 https://aps1-1.relay.n0.iroh.link/）；留空用官方默认地图自动选
+        #[arg(long, default_value = "")]
+        relay: String,
     },
     /// 向对端发送一段文本
     Send {
@@ -94,7 +98,7 @@ fn main() -> Result<()> {
     let secret = net::load_or_create_secret(&key_path)?;
 
     match cli.cmd {
-        Cmd::Serve { headless } => serve(cli.dir, secret, headless),
+        Cmd::Serve { headless, relay } => serve(cli.dir, secret, headless, relay),
         Cmd::Info => block_on(info(secret)),
         Cmd::Send { peer, relay, text } => block_on(send(secret, &peer, &relay, &text)),
         Cmd::Recv { peer, relay } => block_on(recv(secret, &peer, &relay)),
@@ -146,7 +150,7 @@ type Pendings = Arc<Mutex<HashMap<String, Pending>>>;
 /// 正在往外发的传输：id → 控制位，收到对端 `FILE_CANCEL` 时用来踩刹车。
 type Outgoing = Arc<Mutex<HashMap<String, Arc<transfer::TransferFlags>>>>;
 
-fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool) -> Result<()> {
+fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, relay: String) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
     let app = Arc::new(ui::App::new(Arc::clone(&store)));
 
@@ -156,6 +160,7 @@ fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool) -> Result<()> {
     let net_store = Arc::clone(&store);
     let net_app = Arc::clone(&app);
     let net_dir = dir.clone();
+    let net_relay = relay.clone();
     let net_thread = std::thread::Builder::new()
         .name("clipbridge-net".into())
         .spawn(move || {
@@ -166,7 +171,7 @@ fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool) -> Result<()> {
                     return;
                 }
             };
-            if let Err(err) = rt.block_on(serve_net(secret, net_store, net_app, net_dir)) {
+            if let Err(err) = rt.block_on(serve_net(secret, net_store, net_app, net_dir, net_relay)) {
                 eprintln!("[net] {err:#}");
             }
         })
@@ -193,8 +198,9 @@ async fn serve_net(
     store: Arc<Store>,
     app: Arc<ui::App>,
     dir: PathBuf,
+    relay: String,
 ) -> Result<()> {
-    let ep = net::build_endpoint(secret).await?;
+    let ep = net::build_endpoint_with_relay(secret, &relay).await?;
     let peers: Peers = Arc::new(AsyncMutex::new(HashMap::new()));
     let pending: Pendings = Arc::new(Mutex::new(HashMap::new()));
     let outgoing: Outgoing = Arc::new(Mutex::new(HashMap::new()));
@@ -279,7 +285,7 @@ async fn serve_net(
             let Ok(accepting) = incoming.accept() else { return };
             let Ok(conn) = accepting.await else { return };
             let id = conn.remote_id();
-            println!("[conn] accepted {}", id.fmt_short());
+            println!("[conn] accepted {} ({id})", id.fmt_short());
             peers.lock().await.insert(id, conn.clone());
             if let Err(err) = handle_conn(conn, store, pending, outgoing, inbox).await {
                 eprintln!("[conn] {err:#}");
@@ -538,6 +544,73 @@ fn mime_of(path: &Path) -> String {
     .to_string()
 }
 
+/// 每 3s 打一条 `[path]`：当前选中路径是 relay 还是直连、RTT、已发字节、丢包。
+///
+/// 跨网传输慢的时候，这条日志能直接区分「relay 带宽不行」和「直连被打洞失败」，
+/// 光看 `connection lost: timed out` 是分不出来的。传完自动停。
+fn spawn_path_probe(
+    conn: &Connection,
+    name: &str,
+    size: u64,
+    start_at: u64,
+) -> tokio::task::JoinHandle<()> {
+    let conn = conn.clone();
+    let label = name.to_string();
+    let total = size.saturating_sub(start_at);
+    let mut last_tx = 0u64;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        let started = std::time::Instant::now();
+        loop {
+            tick.tick().await;
+            if conn.close_reason().is_some() {
+                break;
+            }
+            let paths = conn.paths();
+            if paths.is_empty() {
+                break;
+            }
+            for p in paths.iter() {
+                let kind = match p.remote_addr() {
+                    TransportAddr::Relay(url) => format!("relay({})", url),
+                    TransportAddr::Ip(addr) => format!("direct({addr})"),
+                    other => format!("{other:?}"),
+                };
+                let st = p.stats();
+                // 选中路径的累计发送字节才是真正在跑的数据量
+                let tx = if p.is_selected() {
+                    let delta = st.udp_tx.bytes.saturating_sub(last_tx);
+                    last_tx = st.udp_tx.bytes;
+                    delta
+                } else {
+                    0
+                };
+                let speed = if p.is_selected() && started.elapsed().as_secs() > 0 {
+                    (st.udp_tx.bytes - start_at) as f64 / 1024.0 / started.elapsed().as_secs_f64()
+                } else {
+                    0.0
+                };
+                println!(
+                    "[path] {} {}{} rtt={}ms cwnd={} mtu={} tx={}KB(+{}KB/3s ≈ {:.0}KB/s) rx={}KB lost={} 已传 {:.1}%",
+                    label,
+                    if p.is_selected() { "*" } else { " " },
+                    kind,
+                    st.rtt.as_millis(),
+                    st.cwnd,
+                    st.current_mtu,
+                    st.udp_tx.bytes / 1024,
+                    tx / 1024,
+                    speed,
+                    st.udp_rx.bytes / 1024,
+                    st.lost_packets,
+                    (st.udp_tx.bytes.saturating_sub(start_at)) as f64 * 100.0
+                        / total.max(1) as f64
+                );
+            }
+        }
+    })
+}
+
 /// 在一条已有连接上推一个文件：OFFER → ACCEPT → 数据流 → 等 COMPLETE。
 ///
 /// 既被 CLI 用（自己拨号），也被 `outbox` 监视用（复用手机拨进来的那条连接）。
@@ -578,7 +651,7 @@ async fn push_file(conn: &Connection, path: &Path, outgoing: &Outgoing) -> Resul
     )
     .await?;
     ctrl_send.finish().ok();
-    let reply = tokio::time::timeout(Duration::from_secs(10), protocol::read_frame(&mut ctrl_recv))
+    let reply = tokio::time::timeout(Duration::from_secs(20), protocol::read_frame(&mut ctrl_recv))
         .await
         .context("offer timeout")??;
     let Some((ty, payload)) = reply else {
@@ -602,10 +675,42 @@ async fn push_file(conn: &Connection, path: &Path, outgoing: &Outgoing) -> Resul
 
     // 2) 数据面；控制位登记到 outgoing，供对端 FILE_CANCEL 踩刹车
     let flags = Arc::new(transfer::TransferFlags::new());
+    // 用户把 outbox 里的源文件删掉 = 取消这一笔。
+    // 注意不能靠 watch_outbox 的 read_dir 判：文件删了就不再出现在目录列表里，
+    // 那段检查是死代码。这里在发送期间直接盯着源文件本身。
+    let watch = {
+        let watch_path = path.to_path_buf();
+        let flags = Arc::clone(&flags);
+        let conn = conn.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                if flags.state() != transfer::ST_RUN {
+                    break;
+                }
+                if !watch_path.exists() {
+                    println!("[cancel] 源文件已删除，停止发送 {}", watch_path.display());
+                    flags.cancel();
+                    // 必须也让对端刹车，否则手机还挂在旧传输上、删不掉半截文件，
+                    // 后续 OFFER 也会因为连接被重传占满而超时
+                    if let Ok((mut s, _r)) = conn.open_bi().await {
+                        let _ = protocol::write_frame(&mut s, protocol::MSG_FILE_CANCEL, id.as_bytes())
+                            .await;
+                        let _ = s.finish();
+                    }
+                    break;
+                }
+            }
+        })
+    };
     outgoing.lock().unwrap().insert(id.clone(), Arc::clone(&flags));
     let (mut send, _recv) = conn.open_bi().await.context("open data stream")?;
     protocol::write_frame(&mut send, protocol::MSG_FILE_DATA, id.as_bytes()).await?;
+    let probe = spawn_path_probe(conn, &name, size, start_at);
     let outcome = transfer::send_stream(&mut send, path, start_at, &flags).await?;
+    watch.abort();
+    probe.abort();
     println!("→ 发送结果 {:?}", outcome);
     outgoing.lock().unwrap().remove(&id);
     if let transfer::SendOutcome::Canceled(_) = outcome {
@@ -615,8 +720,10 @@ async fn push_file(conn: &Connection, path: &Path, outgoing: &Outgoing) -> Resul
         anyhow::bail!("paused");
     }
 
-    // 3) 等对端校验结果（3s 内没回包不算失败，对端可能只是慢）
-    match tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await {
+    // 3) 等对端校验结果。**必须拿到 COMPLETE 才算送达**：
+    //    之前超时后直接当成功，于是数据其实没到齐（跨网 relay 丢包）的文件也被挪进 sent/，
+    //    从此再也不重试。现在改成失败返回，outbox 会用稳定 id 从 .part 续传补齐。
+    match tokio::time::timeout(Duration::from_secs(60), conn.accept_bi()).await {
         Ok(Ok((_s, mut r))) => {
             if let Ok(Some((protocol::MSG_FILE_COMPLETE, payload))) = protocol::read_frame(&mut r).await
             {
@@ -631,7 +738,7 @@ async fn push_file(conn: &Connection, path: &Path, outgoing: &Outgoing) -> Resul
                 anyhow::ensure!(done.ok, "peer reported failure");
             }
         }
-        _ => println!("⚠ 没等到对端 COMPLETE（可能已落盘但回包丢了）"),
+        _ => anyhow::bail!("no COMPLETE from peer (data may be incomplete, will resume)"),
     }
     Ok(())
 }
@@ -677,13 +784,6 @@ async fn watch_outbox(peers: Peers, outgoing: Outgoing, outbox: PathBuf, sent: P
             }
             let mut all_ok = true;
             for conn in conns {
-                // 用户把源文件删了 = 取消这一笔
-                if !path.exists() {
-                    for flags in outgoing.lock().unwrap().values() {
-                        flags.cancel();
-                    }
-                    break;
-                }
                 if let Err(err) = push_file(&conn, &path, &outgoing).await {
                     let text = format!("{err:#}");
                     eprintln!("[outbox] {text}");

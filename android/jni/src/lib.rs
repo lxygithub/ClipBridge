@@ -158,15 +158,17 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
     }
     sess.state("connected");
 
-    // 心跳：每 20s 探一次活。只在失败时记日志，**不主动关连接** ——
-    // 之前直接 close 掉，结果半开检测反而把好连接杀掉了。
+    // 心跳：每 20s 探一次活。QUIC 层现在自己带 3s keepalive + 60s idle，
+    // 这里只负责把「状态」及时反映到 UI，**不再主动关连接**：半开检测反而杀好连接。
     let mut hb = tokio::time::interval(std::time::Duration::from_secs(20));
     let mut hb_fails = 0u32;
     loop {
         let pair = tokio::select! {
             _ = hb.tick() => {
-                // 正在收文件时不探活：大文件会把连接占满，探活超时反而误判
-                if sess.recv_flags.lock().unwrap().is_some() {
+                // 正在传文件（收或发）时不探活：数据流会把带宽占满，探活超时是误判
+                if sess.recv_flags.lock().unwrap().is_some()
+                    || !sess.outgoing.lock().unwrap().is_empty()
+                {
                     continue;
                 }
                 let probe = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -180,10 +182,9 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                     Ok(Ok(())) => hb_fails = 0,
                     _ => hb_fails += 1,
                 }
-                if hb_fails >= 3 {
-                    eprintln!("[jni] heartbeat failed 3 times, dropping conn");
-                    conn.close(0u32.into(), b"stale");
-                    break;
+                if hb_fails >= 10 {
+                    eprintln!("[jni] heartbeat failed 10 times, marking stale");
+                    sess.state("stale");
                 }
                 continue;
             }
@@ -246,6 +247,12 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                 },
                 protocol::MSG_FILE_DATA => {
                     let id = String::from_utf8_lossy(&payload).trim().to_string();
+                    // 同一时刻只允许一条写入流：发送端在 relay 上超时后会重开一条流续传，
+                    // 两条流同时往同一个 .part 追加会把文件写坏（尺寸比源文件还大）。
+                    if sess.recv_flags.lock().unwrap().is_some() {
+                        eprintln!("[jni] already receiving, ignoring duplicate data stream {id}");
+                        return;
+                    }
                     let Some((offer, part)) = sess.pending.lock().unwrap().remove(&id) else {
                         eprintln!("[jni] data for unknown id {id}");
                         return;
@@ -572,7 +579,7 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
         }
     };
 
-    let ep = match rt().block_on(net::build_endpoint(secret)) {
+    let ep = match rt().block_on(net::build_endpoint_with_relay(secret, &relay_s)) {
         Ok(ep) => ep,
         Err(err) => {
             eprintln!("[jni] endpoint: {err:#}");

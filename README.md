@@ -33,11 +33,14 @@ ClipBridge 的取舍：**服务器架在 Windows 上，手机主动拨号**，�
 | 手机端界面（设计稿方向 3「一条通道」） | ✅ |
 | 文件传输：Windows 端收发（`.part` + SHA256 校验 + 同名不覆盖 + ≤2GB 校验）+ `send-file` 命令 | ✅ |
 | 文件传输：PC → 手机（`outbox/` 投递即推，手机落盘 + 校验回包 + 进度/完成通知） | ✅ |
+| 传输可中断（PC 删 outbox 源文件 / 手机通知「取消」）+ 手机接收进度条 | ✅ |
 | 手机端断线探测（20s 心跳探活，半开连接能自己发现并重连） | ✅ |
-| 文件传输：手机 → PC、暂停/恢复/取消 UI | ⬜ 进行中 |
+| 网络稳健性：QUIC 3s 保活 + 60s idle、relay 可钉（默认亚太）、续传 offset 对齐、单写者、`[path]` 路径诊断 | ✅ |
+| 文件传输：手机 → PC、暂停/恢复 UI | ⬜ 进行中 |
 | 图片剪贴板 | ⬜ |
 | 手机端历史持久化 / 多台电脑配对 | ⬜ |
 | Windows 历史窗口自绘（当前仍是原生 EDIT/LISTBOX） | ⬜ |
+| 自建 relay（当前靠官方 relay，跨网大文件只有几十 KB/s） | ⬜ 可选 |
 
 <p align="center">
   <img src="docs/shots/android-detail.png" width="270" alt="手机端条目详情">
@@ -105,17 +108,25 @@ Gradle 不读 Windows 系统代理，走代理时在 `android/gradle.properties`
 ## 使用
 
 1. 电脑端 `clipbridge info` 拿到 `ID`
-2. 手机装 APK，在「设置」里填这个 ID（打包时已内置则跳过），Relay 留空即可
+2. 手机装 APK，在「设置」里填这个 ID（打包时已内置则跳过），Relay 默认 `https://aps1-1.relay.n0.iroh.link/`（亚太）
 3. 电脑上复制文本 → 手机通知栏「来自电脑的文本」，点「复制」
 4. 手机发文本：长按桌面图标选「发送剪贴板」、任意 app 里分享、或下拉点磁贴
 5. 电脑端 `Ctrl+Alt+H` 打开历史窗口
+
+relay 两端最好一致；想换节点（或以后自建）两边填同一个 URL 即可：
+
+```powershell
+clipbridge.exe serve --dir D:\ClipBridge --relay https://aps1-1.relay.n0.iroh.link/
+```
 
 发文件（两个方向都已可用）：
 
 ```powershell
 # 电脑 → 手机：把文件丢进 outbox，serve 会推给所有在线手机
 copy D:\path\to\big.zip D:\ClipBridge\outbox\
-# 成功后自动移到 outbox\sent\；失败留在原地，每 2s 重试并从 .part 断点续传
+# 收到对端 COMPLETE（落盘 + SHA256 通过）才移到 outbox\sent\；
+# 没确认就留在原地，每 2s 重试并从 .part 断点续传
+# 想取消：把 outbox 里那个源文件删掉（会同时通知手机删半截文件）
 
 # 电脑 → 电脑（手机主动拨号，所以不能用 send-file 直接打给手机）
 clipbridge.exe send-file --peer <对方 ID> --file D:\path\to\big.zip
@@ -123,6 +134,7 @@ clipbridge.exe send-file --peer <对方 ID> --file D:\path\to\big.zip
 ```
 
 手机收到的文件在 app 私有目录 `files/inbox/`（要放进系统相册/下载需手动分享）。
+传输期间日志里每 3s 一行 `[path]`，写明走的是 `relay(...)` 还是 `direct(...)`、RTT、丢包、进度。
 
 ## 已知限制
 
@@ -130,6 +142,7 @@ clipbridge.exe send-file --peer <对方 ID> --file D:\path\to\big.zip
 - 国产 ROM 可能杀后台，需要在系统里给「无省电限制 / 自启动」白名单
 - 单条文本超过 64KB 不采集（控制面不塞大 payload）
 - 未做额外鉴权：能连上就信任（`EndpointId` 即身份，白名单待做）
+- **官方 relay 跨网带宽很低**：北京 ↔ 手机实测 25–70 KB/s，RTT 从 600ms 爬到 20s+，打洞没成时大文件只能靠反复续传慢慢补齐（数据不会错，但慢）。根治要么两端同网直连，要么自建 relay（`--relay` 已留好口子）
 
 ## 开发
 
