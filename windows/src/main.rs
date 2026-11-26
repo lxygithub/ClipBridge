@@ -20,10 +20,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use clipbridge_core::{net, protocol, ALPN, DEFAULT_DIR};
+use clipbridge_core::{net, protocol, transfer, ALPN, DEFAULT_DIR};
 use iroh::endpoint::Connection;
 use iroh::EndpointId;
-use tokio::sync::Mutex;
+use std::path::Path;
+use std::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 use clipboard::ClipboardWatcher;
 use queue::Store;
@@ -69,6 +71,15 @@ enum Cmd {
         #[arg(long, default_value = "")]
         relay: String,
     },
+    /// 向对端发一个文件
+    SendFile {
+        #[arg(long)]
+        peer: String,
+        #[arg(long, default_value = "")]
+        relay: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// 开关开机自启（写入 HKCU\...\Run）
     Autostart {
         /// 关闭自启
@@ -87,6 +98,7 @@ fn main() -> Result<()> {
         Cmd::Info => block_on(info(secret)),
         Cmd::Send { peer, relay, text } => block_on(send(secret, &peer, &relay, &text)),
         Cmd::Recv { peer, relay } => block_on(recv(secret, &peer, &relay)),
+        Cmd::SendFile { peer, relay, file } => block_on(send_file(secret, &peer, &relay, file)),
         Cmd::Autostart { off } => {
             std::env::set_var("CLIPBRIDGE_DIR", cli.dir.display().to_string());
             ui::set_autostart(!off);
@@ -120,7 +132,16 @@ async fn info(secret: iroh::SecretKey) -> Result<()> {
 }
 
 /// 已连接设备表。断开后由连接关闭事件清理。
-type Peers = Arc<Mutex<HashMap<EndpointId, Connection>>>;
+type Peers = Arc<AsyncMutex<HashMap<EndpointId, Connection>>>;
+
+/// 已报价、等待数据面流的文件。
+struct Pending {
+    offer: transfer::Offer,
+    part: PathBuf,
+    flags: Arc<transfer::TransferFlags>,
+}
+
+type Pendings = Arc<Mutex<HashMap<String, Pending>>>;
 
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
@@ -172,6 +193,9 @@ async fn serve_net(
 ) -> Result<()> {
     let ep = net::build_endpoint(secret).await?;
     let peers: Peers = Arc::new(Mutex::new(HashMap::new()));
+    let pending: Pendings = Arc::new(Mutex::new(HashMap::new()));
+    let inbox = dir.join("inbox");
+    let _ = std::fs::create_dir_all(&inbox);
 
     println!("=== clipbridge serve ===");
     net::print_endpoint_info(&ep);
@@ -236,13 +260,15 @@ async fn serve_net(
         let Some(incoming) = ep.accept().await else { break };
         let peers = Arc::clone(&peers);
         let store = Arc::clone(&store);
+        let pending = Arc::clone(&pending);
+        let inbox = inbox.clone();
         tokio::spawn(async move {
             let Ok(accepting) = incoming.accept() else { return };
             let Ok(conn) = accepting.await else { return };
             let id = conn.remote_id();
             println!("[conn] accepted {}", id.fmt_short());
             peers.lock().await.insert(id, conn.clone());
-            if let Err(err) = handle_conn(conn, store).await {
+            if let Err(err) = handle_conn(conn, store, pending, inbox).await {
                 eprintln!("[conn] {err:#}");
             }
             peers.lock().await.remove(&id);
@@ -252,7 +278,12 @@ async fn serve_net(
     Ok(())
 }
 
-async fn handle_conn(conn: Connection, store: Arc<Store>) -> Result<()> {
+async fn handle_conn(
+    conn: Connection,
+    store: Arc<Store>,
+    pending: Pendings,
+    inbox: PathBuf,
+) -> Result<()> {
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(s) => s,
@@ -260,6 +291,8 @@ async fn handle_conn(conn: Connection, store: Arc<Store>) -> Result<()> {
         };
         let store = Arc::clone(&store);
         let conn2 = conn.clone();
+        let pending = Arc::clone(&pending);
+        let inbox = inbox.clone();
         tokio::spawn(async move {
             let Ok(Some((ty, payload))) = protocol::read_frame(&mut recv).await else {
                 return;
@@ -295,6 +328,86 @@ async fn handle_conn(conn: Connection, store: Arc<Store>) -> Result<()> {
                     let _ = protocol::write_frame(&mut send, protocol::MSG_ACK, b"").await;
                     let _ = send.finish();
                 }
+                protocol::MSG_FILE_OFFER => match serde_json::from_slice::<transfer::Offer>(&payload) {
+                    Ok(offer) => match prepare_offer(&offer, &inbox, &pending) {
+                        Ok(accept) => {
+                            if let Ok(json) = serde_json::to_vec(&accept) {
+                                let _ = protocol::write_frame(&mut send, protocol::MSG_FILE_ACCEPT, &json).await;
+                            }
+                            let _ = send.finish();
+                            println!(
+                                "[file] offer {} · {} bytes · id {}",
+                                offer.name,
+                                offer.size,
+                                &offer.id[..8.min(offer.id.len())]
+                            );
+                        }
+                        Err(err) => {
+                            let rej = serde_json::json!({ "id": offer.id, "reason": err.to_string() });
+                            let _ = protocol::write_frame(
+                                &mut send,
+                                protocol::MSG_FILE_REJECT,
+                                rej.to_string().as_bytes(),
+                            )
+                            .await;
+                            let _ = send.finish();
+                            eprintln!("[file] reject: {err:#}");
+                        }
+                    },
+                    Err(err) => eprintln!("[file] bad offer: {err:#}"),
+                },
+                protocol::MSG_FILE_DATA => {
+                    let id = String::from_utf8_lossy(&payload).trim().to_string();
+                    let Some(p) = pending.lock().unwrap().remove(&id) else {
+                        eprintln!("[file] data for unknown id {}", &id);
+                        return;
+                    };
+                    println!("[file] receiving {} → {}", p.offer.name, p.part.display());
+                    let received =
+                        match transfer::recv_stream(&mut recv, &p.part, 0, &p.flags, p.offer.size).await
+                        {
+                            Ok(n) => n,
+                            Err(err) => {
+                                eprintln!("[file] recv failed: {err:#}");
+                                return;
+                            }
+                        };
+                    println!("[file] got {} / {} bytes", received, p.offer.size);
+                    if received != p.offer.size {
+                        eprintln!("[file] incomplete, part kept: {}", p.part.display());
+                        return;
+                    }
+                    let digest = match transfer::sha256_file(&p.part) {
+                        Ok(d) => d,
+                        Err(err) => {
+                            eprintln!("[file] hash failed: {err:#}");
+                            return;
+                        }
+                    };
+                    if !p.offer.sha256.is_empty() && !digest.eq_ignore_ascii_case(&p.offer.sha256) {
+                        eprintln!("[file] sha256 mismatch, dropped");
+                        let _ = std::fs::remove_file(&p.part);
+                        let _ = send_complete(&conn2, &p.offer.id, false, &digest, received).await;
+                        return;
+                    }
+                    let dir = inbox.clone();
+                    let final_path = transfer::unique_path(&dir, &transfer::safe_name(&p.offer.name));
+                    match std::fs::rename(&p.part, &final_path) {
+                        Ok(()) => {
+                            println!("[file] saved {}", final_path.display());
+                            let _ = send_complete(&conn2, &p.offer.id, true, &digest, received).await;
+                        }
+                        Err(err) => eprintln!("[file] rename failed: {err:#}"),
+                    }
+                }
+                protocol::MSG_FILE_CANCEL => {
+                    let id = String::from_utf8_lossy(&payload).trim().to_string();
+                    if let Some(p) = pending.lock().unwrap().remove(&id) {
+                        p.flags.cancel();
+                        let _ = std::fs::remove_file(&p.part);
+                        println!("[file] canceled {}", &id);
+                    }
+                }
                 other => eprintln!("[conn] unsupported type {other:#04x}"),
             }
         });
@@ -326,6 +439,170 @@ async fn send(secret: iroh::SecretKey, peer: &str, relay: &str, text: &str) -> R
         Ok(_) => println!("⚠ 连接结束但没收到 ACK"),
         Err(_) => println!("⚠ 等待 ACK 超时"),
     }
+    conn.close(0u32.into(), b"done");
+    ep.close().await;
+    Ok(())
+}
+
+/// 报价校验 + 登记待接收的文件（`.part` 用 transfer id 命名，避开怪字符）。
+fn prepare_offer(
+    offer: &transfer::Offer,
+    inbox: &Path,
+    pending: &Pendings,
+) -> Result<transfer::Accept> {
+    anyhow::ensure!(offer.id.len() == 32, "bad transfer id");
+    anyhow::ensure!(offer.size > 0, "empty file");
+    anyhow::ensure!(
+        offer.size <= transfer::MAX_FILE_SIZE,
+        "file too large ({} bytes > 2GB)",
+        offer.size
+    );
+    let part = inbox.join(format!("{}.part", offer.id));
+    pending.lock().unwrap().insert(
+        offer.id.clone(),
+        Pending {
+            offer: offer.clone(),
+            part,
+            flags: transfer::TransferFlags::new(),
+        },
+    );
+    Ok(transfer::Accept {
+        id: offer.id.clone(),
+        offset: 0,
+    })
+}
+
+async fn send_complete(
+    conn: &Connection,
+    id: &str,
+    ok: bool,
+    sha: &str,
+    size: u64,
+) -> Result<()> {
+    let (mut send, _recv) = conn.open_bi().await.context("open control stream")?;
+    let body = serde_json::to_vec(&transfer::Complete {
+        id: id.to_string(),
+        ok,
+        sha256: sha.to_string(),
+        size,
+    })?;
+    protocol::write_frame(&mut send, protocol::MSG_FILE_COMPLETE, &body).await?;
+    send.finish().ok();
+    Ok(())
+}
+
+/// 按扩展名猜 MIME（只用于展示，不做严格校验）。
+fn mime_of(path: &Path) -> String {
+    match path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain",
+        "zip" => "application/zip",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "apk" => "application/vnd.android.package-archive",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// 一次性发文件：OFFER → ACCEPT → 数据流 → 等 COMPLETE。
+async fn send_file(
+    secret: iroh::SecretKey,
+    peer: &str,
+    relay: &str,
+    path: PathBuf,
+) -> Result<()> {
+    let meta = std::fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+    anyhow::ensure!(meta.is_file(), "not a file");
+    let size = meta.len();
+    anyhow::ensure!(size > 0, "empty file");
+    anyhow::ensure!(
+        size <= transfer::MAX_FILE_SIZE,
+        "file too large: {size} bytes (limit 2GB)"
+    );
+
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let id = transfer::new_id(&path.display().to_string());
+    let sha = transfer::sha256_file(&path)?;
+
+    let offer = transfer::Offer {
+        id: id.clone(),
+        name,
+        size,
+        sha256: sha.clone(),
+        mime: mime_of(&path),
+    };
+
+    let addr = net::parse_peer(peer, relay)?;
+    let ep = net::build_endpoint(secret).await?;
+    let conn = ep.connect(addr, ALPN).await.context("connect failed")?;
+
+    // 1) 报价
+    let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await.context("open control stream")?;
+    protocol::write_frame(
+        &mut ctrl_send,
+        protocol::MSG_FILE_OFFER,
+        &serde_json::to_vec(&offer)?,
+    )
+    .await?;
+    ctrl_send.finish().ok();
+    let reply = tokio::time::timeout(Duration::from_secs(10), protocol::read_frame(&mut ctrl_recv))
+        .await
+        .context("offer timeout")??;
+    let Some((ty, payload)) = reply else {
+        anyhow::bail!("peer closed before accepting");
+    };
+    match ty {
+        protocol::MSG_FILE_ACCEPT => {
+            let accept: transfer::Accept = serde_json::from_slice(&payload)?;
+            println!(
+                "✓ 对方已接受（{}，{} bytes，从 {} 续传）",
+                offer.name, offer.size, accept.offset
+            );
+        }
+        protocol::MSG_FILE_REJECT => {
+            anyhow::bail!("peer rejected: {}", String::from_utf8_lossy(&payload));
+        }
+        other => anyhow::bail!("unexpected reply {other:#04x}"),
+    }
+
+    // 2) 数据面
+    let flags = transfer::TransferFlags::new();
+    let (mut send, _recv) = conn.open_bi().await.context("open data stream")?;
+    protocol::write_frame(&mut send, protocol::MSG_FILE_DATA, id.as_bytes()).await?;
+    let outcome = transfer::send_stream(&mut send, &path, 0, &flags).await?;
+    println!("→ 发送结果 {:?}", outcome);
+
+    // 3) 等对端校验结果
+    match tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await {
+        Ok(Ok((_s, mut r))) => {
+            if let Ok(Some((protocol::MSG_FILE_COMPLETE, payload))) = protocol::read_frame(&mut r).await
+            {
+                let done: transfer::Complete = serde_json::from_slice(&payload)?;
+                println!(
+                    "{} 校验 {} · {} bytes · sha256 {}",
+                    if done.ok { "✓ 已完成" } else { "✗ 失败" },
+                    if done.ok { "通过" } else { "不通过" },
+                    done.size,
+                    &done.sha256[..8.min(done.sha256.len())]
+                );
+            }
+        }
+        _ => println!("⚠ 没等到对端 COMPLETE（可能已落盘但回包丢了）"),
+    }
+
     conn.close(0u32.into(), b"done");
     ep.close().await;
     Ok(())

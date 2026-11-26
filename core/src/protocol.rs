@@ -15,6 +15,9 @@ pub const MSG_FILE_COMPLETE: u8 = 0x13;
 pub const MSG_FILE_PAUSE: u8 = 0x14;
 pub const MSG_FILE_RESUME: u8 = 0x15;
 pub const MSG_FILE_CANCEL: u8 = 0x16;
+/// 数据面流首帧：`payload` = 16 字节 transfer id 的 hex，其后是裸文件字节。
+/// 架构文档里这张表停在 0x16，这里补 0x17，不改动已有编号。
+pub const MSG_FILE_DATA: u8 = 0x17;
 pub const MSG_ACK: u8 = 0x20;
 pub const MSG_PING: u8 = 0x21;
 

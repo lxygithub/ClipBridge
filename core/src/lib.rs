@@ -4,6 +4,7 @@
 
 pub mod net;
 pub mod protocol;
+pub mod transfer;
 
 /// 本协议的 ALPN 标识。
 pub const ALPN: &[u8] = b"clipbridge/1";
