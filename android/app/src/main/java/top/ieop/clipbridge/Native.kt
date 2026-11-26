@@ -21,6 +21,9 @@ object Native {
     /** 发一个文件到 PC；返回是否把数据写完了（校验结果走 onFileSent）。 */
     external fun nativeSendFile(path: String): Boolean
 
+    /** 取消当前正在接收的传输；返回是否真的有一笔在跑。 */
+    external fun nativeCancelTransfer(): Boolean
+
     /** `"<id>|<relay>|<state>"` */
     external fun nativeSelfInfo(): String
 

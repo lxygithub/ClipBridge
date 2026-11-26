@@ -50,6 +50,8 @@ struct Session {
     pending: Mutex<std::collections::HashMap<String, (transfer::Offer, PathBuf)>>,
     /// 手机发出去的文件：id → 文件名，等 COMPLETE 时回调
     outgoing: Mutex<std::collections::HashMap<String, String>>,
+    /// 正在接收的传输：id + 控制位，供「取消」按钮踩刹车
+    recv_flags: Mutex<Option<(String, Arc<transfer::TransferFlags>)>>,
 }
 
 impl Session {
@@ -156,11 +158,17 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
     }
     sess.state("connected");
 
-    // 每 15s 探一次活：半开连接上 accept_bi 会一直挂住，只有主动写才能发现断线
+    // 心跳：每 20s 探一次活。只在失败时记日志，**不主动关连接** ——
+    // 之前直接 close 掉，结果半开检测反而把好连接杀掉了。
     let mut hb = tokio::time::interval(std::time::Duration::from_secs(20));
+    let mut hb_fails = 0u32;
     loop {
         let pair = tokio::select! {
             _ = hb.tick() => {
+                // 正在收文件时不探活：大文件会把连接占满，探活超时反而误判
+                if sess.recv_flags.lock().unwrap().is_some() {
+                    continue;
+                }
                 let probe = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                     let (mut s, _r) = conn.open_bi().await?;
                     protocol::write_frame(&mut s, protocol::MSG_PING, b"").await?;
@@ -169,12 +177,11 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                 })
                 .await;
                 match &probe {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => eprintln!("[jni] heartbeat error: {err:#}"),
-                    Err(_) => eprintln!("[jni] heartbeat timeout"),
+                    Ok(Ok(())) => hb_fails = 0,
+                    _ => hb_fails += 1,
                 }
-                if !matches!(probe, Ok(Ok(()))) {
-                    eprintln!("[jni] heartbeat failed, dropping conn");
+                if hb_fails >= 3 {
+                    eprintln!("[jni] heartbeat failed 3 times, dropping conn");
                     conn.close(0u32.into(), b"stale");
                     break;
                 }
@@ -243,17 +250,50 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                         eprintln!("[jni] data for unknown id {id}");
                         return;
                     };
-                    let flags = transfer::TransferFlags::new();
+                    let flags = Arc::new(transfer::TransferFlags::new());
+                    *sess.recv_flags.lock().unwrap() = Some((id.clone(), Arc::clone(&flags)));
                     let name = transfer::safe_name(&offer.name);
                     let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
                     sess.notify_progress(&name, have, offer.size);
+                    // 每 0.5s 把 flags 里的进度回灌到通知，否则进度条一直停在 0%
+                    let watch_flags = Arc::clone(&flags);
+                    let watch_name = name.clone();
+                    let watch_total = offer.size;
+                    let watch_sess = Arc::clone(&sess);
+                    let watcher = tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            let done = watch_flags.offset();
+                            if watch_flags.state() == transfer::ST_CANCEL || done >= watch_total {
+                                break;
+                            }
+                            watch_sess.notify_progress(&watch_name, done, watch_total);
+                        }
+                    });
                     let received = match transfer::recv_stream(&mut recv, &part, have, &flags, offer.size).await {
                         Ok(n) => n,
                         Err(err) => {
+                            watcher.abort();
                             eprintln!("[jni] recv failed: {err:#}");
                             return;
                         }
                     };
+                    watcher.abort();
+                    *sess.recv_flags.lock().unwrap() = None;
+                    if flags.state() == transfer::ST_CANCEL {
+                        // 用户点了「取消」：删掉半截文件，并让 PC 别再重试
+                        let _ = std::fs::remove_file(&part);
+                        sess.notify_progress(&name, 0, 0);
+                        eprintln!("[jni] receive canceled by user: {name}");
+                        let conn = sess.conn.lock().unwrap().clone();
+                        if let Some(conn) = conn {
+                            if let Ok((mut s, _r)) = conn.open_bi().await {
+                                let _ = protocol::write_frame(&mut s, protocol::MSG_FILE_CANCEL, id.as_bytes()).await;
+                                let _ = s.finish();
+                            }
+                        }
+                        return;
+                    }
                     let digest = transfer::sha256_file(&part).unwrap_or_default();
                     if received != offer.size
                         || (!offer.sha256.is_empty() && !digest.eq_ignore_ascii_case(&offer.sha256))
@@ -551,6 +591,7 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
         acked: AtomicU64::new(read_last_seq(&dir_path)),
         pending: Mutex::new(std::collections::HashMap::new()),
         outgoing: Mutex::new(std::collections::HashMap::new()),
+        recv_flags: Mutex::new(None),
     });
 
     *slot().lock().unwrap() = Some(Arc::clone(&sess));
@@ -585,6 +626,24 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeSendText(
     match sess {
         Some(sess) if sess.push_text(&text) => JNI_TRUE,
         _ => JNI_FALSE,
+    }
+}
+
+/// `Native.cancelTransfer()`：取消当前正在接收的传输。
+#[no_mangle]
+pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeCancelTransfer(
+    _env: JNIEnv,
+    _class: JObject,
+) -> jboolean {
+    let sess = slot().lock().unwrap().clone();
+    let Some(sess) = sess else { return JNI_FALSE };
+    let flags = sess.recv_flags.lock().unwrap().as_ref().map(|(_, f)| Arc::clone(f));
+    match flags {
+        Some(flags) => {
+            flags.cancel();
+            JNI_TRUE
+        }
+        None => JNI_FALSE,
     }
 }
 

@@ -82,6 +82,11 @@ object Notifier {
             Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val cancel = PendingIntent.getService(
+            ctx, 3,
+            Intent(ctx, SyncService::class.java).setAction(SyncService.ACTION_CANCEL_TRANSFER),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         val n = Notification.Builder(ctx, CH_FILE)
             .setSmallIcon(R.drawable.ic_shortcut_file)
             .setContentTitle("接收文件 · $name")
@@ -89,11 +94,13 @@ object Notifier {
             .setProgress(100, pct, total <= 0)
             .setContentIntent(open)
             .setOngoing(true)
+            .addAction(Notification.Action.Builder(null, "取消", cancel).build())
             .build()
         ctx.getSystemService(NotificationManager::class.java).notify(FILE_ID, n)
     }
 
-    fun showFile(ctx: Context, name: String, size: Long) {        val open = PendingIntent.getActivity(
+    fun showFile(ctx: Context, name: String, size: Long) {
+        val open = PendingIntent.getActivity(
             ctx, 2,
             Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
@@ -120,6 +127,17 @@ object Notifier {
             .setContentTitle(if (ok) "已发送 · $name" else "发送失败 · $name")
             .setContentText(if (ok) "电脑已校验并落盘" else "未完成，可重试")
             .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        ctx.getSystemService(NotificationManager::class.java).notify(FILE_ID, n)
+    }
+
+    /** 用户取消接收：把进度通知换成一条「已取消」。 */
+    fun showFileCanceled(ctx: Context, name: String) {
+        val n = Notification.Builder(ctx, CH_FILE)
+            .setSmallIcon(R.drawable.ic_shortcut_file)
+            .setContentTitle("已取消 · $name")
+            .setContentText("半截文件已删除，电脑不会再重试")
             .setAutoCancel(true)
             .build()
         ctx.getSystemService(NotificationManager::class.java).notify(FILE_ID, n)

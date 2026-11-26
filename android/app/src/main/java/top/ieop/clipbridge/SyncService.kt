@@ -33,6 +33,12 @@ class SyncService : Service(), BridgeListener {
             return START_NOT_STICKY
         }
 
+        if (intent?.action == ACTION_CANCEL_TRANSFER) {
+            // 通知栏「取消」：Rust 侧会中断接收、删掉半截文件并让 PC 停止重试
+            Thread { Native.nativeCancelTransfer() }.start()
+            return START_STICKY
+        }
+
         val prefs = Prefs(this)
         if (!prefs.isConfigured) {
             Log.w(TAG, "no peer configured, service stops")
@@ -79,7 +85,9 @@ class SyncService : Service(), BridgeListener {
     }
 
     override fun onFileProgress(name: String, done: Long, total: Long) {
-        Notifier.updateFileProgress(this, name, done, total)
+        // total == 0 是「被取消」的约定信号
+        if (total <= 0) Notifier.showFileCanceled(this, name)
+        else Notifier.updateFileProgress(this, name, done, total)
     }
 
     override fun onFileSent(name: String, ok: Boolean) {
@@ -104,6 +112,15 @@ class SyncService : Service(), BridgeListener {
 
     companion object {
         private const val TAG = "SyncService"
+
+        const val ACTION_CANCEL_TRANSFER = "top.ieop.clipbridge.CANCEL_TRANSFER"
+
+        /** 通知栏「取消」按钮用：不新起服务，直接投给已运行的服务。 */
+        fun cancelTransfer(context: Context) {
+            context.startService(
+                Intent(context, SyncService::class.java).setAction(ACTION_CANCEL_TRANSFER)
+            )
+        }
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, SyncService::class.java))

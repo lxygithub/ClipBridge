@@ -143,6 +143,9 @@ struct Pending {
 
 type Pendings = Arc<Mutex<HashMap<String, Pending>>>;
 
+/// 正在往外发的传输：id → 控制位，收到对端 `FILE_CANCEL` 时用来踩刹车。
+type Outgoing = Arc<Mutex<HashMap<String, Arc<transfer::TransferFlags>>>>;
+
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
     let app = Arc::new(ui::App::new(Arc::clone(&store)));
@@ -194,12 +197,14 @@ async fn serve_net(
     let ep = net::build_endpoint(secret).await?;
     let peers: Peers = Arc::new(AsyncMutex::new(HashMap::new()));
     let pending: Pendings = Arc::new(Mutex::new(HashMap::new()));
+    let outgoing: Outgoing = Arc::new(Mutex::new(HashMap::new()));
     let inbox = dir.join("inbox");
     let _ = std::fs::create_dir_all(&inbox);
     let outbox = dir.join("outbox");
     let _ = std::fs::create_dir_all(&outbox);
     tokio::spawn(watch_outbox(
         Arc::clone(&peers),
+        Arc::clone(&outgoing),
         outbox.clone(),
         outbox.join("sent"),
     ));
@@ -268,6 +273,7 @@ async fn serve_net(
         let peers = Arc::clone(&peers);
         let store = Arc::clone(&store);
         let pending = Arc::clone(&pending);
+        let outgoing = Arc::clone(&outgoing);
         let inbox = inbox.clone();
         tokio::spawn(async move {
             let Ok(accepting) = incoming.accept() else { return };
@@ -275,7 +281,7 @@ async fn serve_net(
             let id = conn.remote_id();
             println!("[conn] accepted {}", id.fmt_short());
             peers.lock().await.insert(id, conn.clone());
-            if let Err(err) = handle_conn(conn, store, pending, inbox).await {
+            if let Err(err) = handle_conn(conn, store, pending, outgoing, inbox).await {
                 eprintln!("[conn] {err:#}");
             }
             peers.lock().await.remove(&id);
@@ -289,6 +295,7 @@ async fn handle_conn(
     conn: Connection,
     store: Arc<Store>,
     pending: Pendings,
+    outgoing: Outgoing,
     inbox: PathBuf,
 ) -> Result<()> {
     loop {
@@ -299,6 +306,7 @@ async fn handle_conn(
         let store = Arc::clone(&store);
         let conn2 = conn.clone();
         let pending = Arc::clone(&pending);
+        let outgoing = Arc::clone(&outgoing);
         let inbox = inbox.clone();
         tokio::spawn(async move {
             let Ok(Some((ty, payload))) = protocol::read_frame(&mut recv).await else {
@@ -414,6 +422,11 @@ async fn handle_conn(
                         let _ = std::fs::remove_file(&p.part);
                         println!("[file] canceled {}", &id);
                     }
+                    // 也可能是在取消我们发出去的这一笔
+                    if let Some(flags) = outgoing.lock().unwrap().get(&id).cloned() {
+                        flags.cancel();
+                        println!("[file] peer canceled outgoing {}", &id);
+                    }
                 }
                 protocol::MSG_PING => {
                     let _ = protocol::write_frame(&mut send, protocol::MSG_PING, b"").await;
@@ -528,7 +541,7 @@ fn mime_of(path: &Path) -> String {
 /// 在一条已有连接上推一个文件：OFFER → ACCEPT → 数据流 → 等 COMPLETE。
 ///
 /// 既被 CLI 用（自己拨号），也被 `outbox` 监视用（复用手机拨进来的那条连接）。
-async fn push_file(conn: &Connection, path: &Path) -> Result<()> {
+async fn push_file(conn: &Connection, path: &Path, outgoing: &Outgoing) -> Result<()> {
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     anyhow::ensure!(meta.is_file(), "not a file");
     let size = meta.len();
@@ -587,12 +600,20 @@ async fn push_file(conn: &Connection, path: &Path) -> Result<()> {
         other => anyhow::bail!("unexpected reply {other:#04x}"),
     }
 
-    // 2) 数据面
-    let flags = transfer::TransferFlags::new();
+    // 2) 数据面；控制位登记到 outgoing，供对端 FILE_CANCEL 踩刹车
+    let flags = Arc::new(transfer::TransferFlags::new());
+    outgoing.lock().unwrap().insert(id.clone(), Arc::clone(&flags));
     let (mut send, _recv) = conn.open_bi().await.context("open data stream")?;
     protocol::write_frame(&mut send, protocol::MSG_FILE_DATA, id.as_bytes()).await?;
     let outcome = transfer::send_stream(&mut send, path, start_at, &flags).await?;
     println!("→ 发送结果 {:?}", outcome);
+    outgoing.lock().unwrap().remove(&id);
+    if let transfer::SendOutcome::Canceled(_) = outcome {
+        anyhow::bail!("canceled by peer");
+    }
+    if let transfer::SendOutcome::Paused(_) = outcome {
+        anyhow::bail!("paused");
+    }
 
     // 3) 等对端校验结果（3s 内没回包不算失败，对端可能只是慢）
     match tokio::time::timeout(Duration::from_secs(15), conn.accept_bi()).await {
@@ -625,7 +646,8 @@ async fn send_file(
     let addr = net::parse_peer(peer, relay)?;
     let ep = net::build_endpoint(secret).await?;
     let conn = ep.connect(addr, ALPN).await.context("connect failed")?;
-    push_file(&conn, &path).await?;
+    let outgoing: Outgoing = Arc::new(Mutex::new(HashMap::new()));
+    push_file(&conn, &path, &outgoing).await?;
     conn.close(0u32.into(), b"done");
     ep.close().await;
     Ok(())
@@ -633,9 +655,11 @@ async fn send_file(
 
 /// `outbox/` 监视：放进去的文件会被推给所有在线设备，成功后移到 `outbox/sent/`。
 ///
-/// 手机是被动方（它主动拨号过来），所以 PC → 手机的文件只能复用这条已建好的连接。
-async fn watch_outbox(peers: Peers, outbox: PathBuf, sent: PathBuf) {
+/// 取消：传输中把 outbox 里的源文件删掉即可；被对端取消的落到 `outbox/cancelled/`，不再重试。
+async fn watch_outbox(peers: Peers, outgoing: Outgoing, outbox: PathBuf, sent: PathBuf) {
     let _ = std::fs::create_dir_all(&sent);
+    let cancelled = outbox.join("cancelled");
+    let _ = std::fs::create_dir_all(&cancelled);
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let entries = match std::fs::read_dir(&outbox) {
@@ -653,8 +677,23 @@ async fn watch_outbox(peers: Peers, outbox: PathBuf, sent: PathBuf) {
             }
             let mut all_ok = true;
             for conn in conns {
-                if let Err(err) = push_file(&conn, &path).await {
-                    eprintln!("[outbox] {err:#}");
+                // 用户把源文件删了 = 取消这一笔
+                if !path.exists() {
+                    for flags in outgoing.lock().unwrap().values() {
+                        flags.cancel();
+                    }
+                    break;
+                }
+                if let Err(err) = push_file(&conn, &path, &outgoing).await {
+                    let text = format!("{err:#}");
+                    eprintln!("[outbox] {text}");
+                    if text.contains("canceled by peer") {
+                        if let Some(name) = path.file_name() {
+                            let _ = std::fs::rename(&path, cancelled.join(name));
+                        }
+                        all_ok = false;
+                        break;
+                    }
                     all_ok = false;
                 }
             }
@@ -700,4 +739,6 @@ async fn recv(secret: iroh::SecretKey, peer: &str, relay: &str) -> Result<()> {
     }
     Ok(())
 }
+
+
 
