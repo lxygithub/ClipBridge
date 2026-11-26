@@ -48,6 +48,8 @@ struct Session {
     acked: AtomicU64,
     /// 已报价、等待数据流的文件：id → (offer, .part 路径)
     pending: Mutex<std::collections::HashMap<String, (transfer::Offer, PathBuf)>>,
+    /// 手机发出去的文件：id → 文件名，等 COMPLETE 时回调
+    outgoing: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Session {
@@ -96,8 +98,7 @@ impl Session {
         );
     }
 
-    fn notify_progress(&self, name: &str, done: u64, total: u64) {
-        let Ok(mut env) = self.vm.attach_current_thread() else {
+    fn notify_progress(&self, name: &str, done: u64, total: u64) {        let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
         let Ok(n) = env.new_string(name) else { return };
@@ -110,6 +111,20 @@ impl Session {
                 JValue::Long(done as jlong),
                 JValue::Long(total as jlong),
             ],
+        );
+    }
+
+    /// 发送结果（PC 回 COMPLETE 时触发）：ok 为校验是否通过。
+    fn notify_sent(&self, name: &str, ok: bool) {
+        let Ok(mut env) = self.vm.attach_current_thread() else {
+            return;
+        };
+        let Ok(n) = env.new_string(name) else { return };
+        let _ = env.call_method(
+            self.cb.as_obj(),
+            "onFileSent",
+            "(Ljava/lang/String;Z)V",
+            &[JValue::Object(&JObject::from(n)), JValue::Bool(ok as u8)],
         );
     }
 
@@ -272,6 +287,19 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                         }
                     }
                 }
+                protocol::MSG_FILE_COMPLETE => {
+                    // PC 侧校验结果：手机发出去的文件到这一步才算真完成
+                    if let Ok(done) = serde_json::from_slice::<transfer::Complete>(&payload) {
+                        eprintln!("[jni] complete ok={} size={}", done.ok, done.size);
+                        let name = sess
+                            .outgoing
+                            .lock()
+                            .unwrap()
+                            .remove(&done.id)
+                            .unwrap_or_else(|| done.id.clone());
+                        sess.notify_sent(&name, done.ok);
+                    }
+                }
                 protocol::MSG_FILE_CANCEL => {
                     let id = String::from_utf8_lossy(&payload).trim().to_string();
                     if let Some((_, part)) = sess.pending.lock().unwrap().remove(&id) {
@@ -339,6 +367,112 @@ impl Session {
                 tokio::time::timeout(Duration::from_secs(5), protocol::read_frame(&mut recv)).await,
                 Ok(Ok(Some((protocol::MSG_ACK, _))))
             )
+        })
+    }
+
+    /// 发一个文件到 PC：OFFER → ACCEPT → 数据流；COMPLETE 由 pump 侧回调。
+    fn send_file(&self, path: &str) -> bool {
+        let p = PathBuf::from(path);
+        let meta = match std::fs::metadata(&p) {
+            Ok(m) if m.is_file() => m,
+            _ => {
+                eprintln!("[jni] not a file: {path}");
+                return false;
+            }
+        };
+        let size = meta.len();
+        if size == 0 || size > transfer::MAX_FILE_SIZE {
+            eprintln!("[jni] bad size {size}");
+            return false;
+        }
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".into());
+        let id = transfer::new_id(&p.display().to_string(), size);
+        let sha = match transfer::sha256_file(&p) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[jni] sha: {err:#}");
+                return false;
+            }
+        };
+        let offer = transfer::Offer {
+            id: id.clone(),
+            name: name.clone(),
+            size,
+            sha256: sha,
+            mime: String::new(),
+        };
+        self.outgoing
+            .lock()
+            .unwrap()
+            .insert(id.clone(), name.clone());
+
+        rt().block_on(async {
+            let conn = {
+                let guard = self.conn.lock().unwrap();
+                guard.clone()
+            };
+            let conn = match conn {
+                Some(c) => c,
+                None => match tokio::time::timeout(Duration::from_secs(8), self.connect_once()).await
+                {
+                    Ok(Ok(c)) => c,
+                    _ => return false,
+                },
+            };
+            let Ok((mut ctrl_send, mut ctrl_recv)) = conn.open_bi().await else {
+                return false;
+            };
+            let Ok(json) = serde_json::to_vec(&offer) else {
+                return false;
+            };
+            if protocol::write_frame(&mut ctrl_send, protocol::MSG_FILE_OFFER, &json)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            ctrl_send.finish().ok();
+            let offset = match tokio::time::timeout(
+                Duration::from_secs(15),
+                protocol::read_frame(&mut ctrl_recv),
+            )
+            .await
+            {
+                Ok(Ok(Some((protocol::MSG_FILE_ACCEPT, payload)))) => {
+                    serde_json::from_slice::<transfer::Accept>(&payload)
+                        .map(|a| a.offset.min(size))
+                        .unwrap_or(0)
+                }
+                _ => {
+                    eprintln!("[jni] offer not accepted");
+                    return false;
+                }
+            };
+
+            self.notify_progress(&name, offset, size);
+            let flags = transfer::TransferFlags::new();
+            let Ok((mut send, _recv)) = conn.open_bi().await else {
+                return false;
+            };
+            if protocol::write_frame(&mut send, protocol::MSG_FILE_DATA, id.as_bytes())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            match transfer::send_stream(&mut send, &p, offset, &flags).await {
+                Ok(outcome) => {
+                    eprintln!("[jni] send {name} → {outcome:?}");
+                    true
+                }
+                Err(err) => {
+                    eprintln!("[jni] send failed: {err:#}");
+                    false
+                }
+            }
         })
     }
 }
@@ -416,6 +550,7 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
         relay: relay_s,
         acked: AtomicU64::new(read_last_seq(&dir_path)),
         pending: Mutex::new(std::collections::HashMap::new()),
+        outgoing: Mutex::new(std::collections::HashMap::new()),
     });
 
     *slot().lock().unwrap() = Some(Arc::clone(&sess));
@@ -449,6 +584,21 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeSendText(
     let sess = slot().lock().unwrap().clone();
     match sess {
         Some(sess) if sess.push_text(&text) => JNI_TRUE,
+        _ => JNI_FALSE,
+    }
+}
+
+/// `Native.sendFile(path)`：把手机上的文件推给 PC，返回是否发完。
+#[no_mangle]
+pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeSendFile(
+    mut env: JNIEnv,
+    _class: JObject,
+    path: JString,
+) -> jboolean {
+    let path = jstring_to_string(&mut env, &path);
+    let sess = slot().lock().unwrap().clone();
+    match sess {
+        Some(sess) if sess.send_file(&path) => JNI_TRUE,
         _ => JNI_FALSE,
     }
 }
@@ -497,5 +647,6 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeAckedSeq(
         .map(|s| s.acked.load(Ordering::Relaxed) as jlong)
         .unwrap_or(0)
 }
+
 
 

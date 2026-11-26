@@ -7,9 +7,12 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -50,9 +53,22 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+/** 从 content Uri 里取一个能当文件名的显示名。 */
+private fun queryName(ctx: Context, uri: android.net.Uri): String {
+    val fallback = "file-" + System.currentTimeMillis()
+    val name = runCatching {
+        ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+        }
+    }.getOrNull()
+    return (name ?: fallback).replace(Regex("[\\\\/:*?\"<>|]"), "_")
+}
 
 /** 方向 3「一条通道」的色板。 */
 object Palette {
@@ -129,6 +145,30 @@ private fun ChannelScreen(
 
     val connected = state == "connected"
     val accent = if (connected) Palette.teal else Color(0xFF8795A4)
+
+    // 手机 → 电脑发文件：选一个文档，先复制到应用缓存再交给 native
+    val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        Thread {
+            val name = queryName(ctx, uri)
+            val tmp = File(ctx.cacheDir, name)
+            val okCopy = runCatching {
+                ctx.contentResolver.openInputStream(uri)!!.use { input ->
+                    tmp.outputStream().use { input.copyTo(it) }
+                }
+                true
+            }.getOrDefault(false)
+            if (!okCopy) {
+                Handler(Looper.getMainLooper()).post { toast(ctx, "读取文件失败") }
+                return@Thread
+            }
+            val ok = runCatching { Native.nativeSendFile(tmp.absolutePath) }.getOrDefault(false)
+            tmp.delete()
+            Handler(Looper.getMainLooper()).post {
+                toast(ctx, if (ok) "已发送，等待电脑校验" else "发送失败：未连接")
+            }
+        }.start()
+    }
 
     Column(
         modifier = Modifier
@@ -219,7 +259,10 @@ private fun ChannelScreen(
                     }.start()
                 }
             }
-            OutlineAction("断开", Palette.dim, Modifier.width(76.dp)) {
+            OutlineAction("发文件", Palette.amber, Modifier.width(88.dp)) {
+                pickFile.launch(arrayOf("*/*"))
+            }
+            OutlineAction("断开", Palette.dim, Modifier.width(64.dp)) {
                 onStop()
                 toast(ctx, "已断开")
             }
@@ -409,7 +452,11 @@ private fun TimelineRow(item: ClipItem, onClick: () -> Unit) {
                     )
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        if (item.seq > 0) "#${item.seq} · ${item.text.length} 字" else "已送达 · ${item.text.length} 字",
+                        when {
+                            item.seq > 0 -> "#${item.seq} · ${item.text.length} 字"
+                            item.text.contains('·') && (item.text.startsWith("文件") || item.text.startsWith("已发送") || item.text.startsWith("发送失败")) -> "文件"
+                            else -> "已送达 · ${item.text.length} 字"
+                        },
                         color = Palette.faint,
                         fontSize = 8.sp,
                         letterSpacing = 0.8.sp
@@ -539,3 +586,4 @@ private fun writeClipboard(ctx: Context, text: String) {
 
 private fun toast(ctx: Context, msg: String) =
     Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+

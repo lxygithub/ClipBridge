@@ -93,8 +93,7 @@ object Notifier {
         ctx.getSystemService(NotificationManager::class.java).notify(FILE_ID, n)
     }
 
-    fun showFile(ctx: Context, name: String, size: Long) {
-        val open = PendingIntent.getActivity(
+    fun showFile(ctx: Context, name: String, size: Long) {        val open = PendingIntent.getActivity(
             ctx, 2,
             Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
@@ -103,6 +102,23 @@ object Notifier {
             .setSmallIcon(R.drawable.ic_shortcut_file)
             .setContentTitle("文件已保存 · $name")
             .setContentText(human(size) + " · 在应用内查看路径")
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        ctx.getSystemService(NotificationManager::class.java).notify(FILE_ID, n)
+    }
+
+    /** 手机发文件的结果。 */
+    fun showFileSent(ctx: Context, name: String, ok: Boolean) {
+        val open = PendingIntent.getActivity(
+            ctx, 2,
+            Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val n = Notification.Builder(ctx, CH_FILE)
+            .setSmallIcon(R.drawable.ic_shortcut_file)
+            .setContentTitle(if (ok) "已发送 · $name" else "发送失败 · $name")
+            .setContentText(if (ok) "电脑已校验并落盘" else "未完成，可重试")
             .setContentIntent(open)
             .setAutoCancel(true)
             .build()

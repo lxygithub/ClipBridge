@@ -82,6 +82,18 @@ class SyncService : Service(), BridgeListener {
         Notifier.updateFileProgress(this, name, done, total)
     }
 
+    override fun onFileSent(name: String, ok: Boolean) {
+        BridgeState.push(
+            ClipItem(
+                seq = 0,
+                text = if (ok) "已发送 · $name" else "发送失败 · $name",
+                ts = System.currentTimeMillis(),
+                outgoing = true
+            )
+        )
+        Notifier.showFileSent(this, name, ok)
+    }
+
     override fun onDestroy() {
         Native.nativeStop()
         started = false

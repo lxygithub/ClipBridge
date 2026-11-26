@@ -18,6 +18,9 @@ object Native {
     /** 发一条文本到 PC，返回是否收到 ACK。 */
     external fun nativeSendText(text: String): Boolean
 
+    /** 发一个文件到 PC；返回是否把数据写完了（校验结果走 onFileSent）。 */
+    external fun nativeSendFile(path: String): Boolean
+
     /** `"<id>|<relay>|<state>"` */
     external fun nativeSelfInfo(): String
 
@@ -34,4 +37,7 @@ interface BridgeListener {
 
     /** 文件接收进度，用于进度通知。 */
     fun onFileProgress(name: String, done: Long, total: Long) {}
+
+    /** 手机发出去的文件，电脑回报校验结果。 */
+    fun onFileSent(name: String, ok: Boolean) {}
 }
