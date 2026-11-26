@@ -1,0 +1,14 @@
+/target
+/windows/target
+/build.log
+/android/.gradle
+/android/.idea
+/android/local.properties
+/android/**/build
+/.idea
+*.iml
+
+# 构建产物：APK 里的 .so 由 cargo-ndk 产出，不入库
+/android/app/src/main/jniLibs/
+# 本机配置
+/android/gradle/gradle-daemon-jvm.properties

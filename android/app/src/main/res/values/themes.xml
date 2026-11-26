@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ClipBridge" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- 1dp 透明，用于快捷方式 / 分享面板 / 磁贴，处理完立刻 finish -->
+    <style name="Theme.ClipBridge.Transparent" parent="android:Theme.Translucent.NoTitleBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+
+    <!-- 无界面兜底，仅用于写剪贴板 -->
+    <style name="Theme.ClipBridge.NoDisplay" parent="android:Theme.NoDisplay">
+        <item name="android:windowNoDisplay">true</item>
+    </style>
+</resources>

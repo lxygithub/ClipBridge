@@ -1,0 +1,95 @@
+package top.ieop.clipbridge
+
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.os.IBinder
+import android.util.Log
+
+/**
+ * 实时模式常驻服务：持有到 Windows 的 iroh 长连接，收到推送就发通知。
+ *
+ * 生命周期：MainActivity / 开机自启 / 快捷方式入口都可以拉起它；
+ * Rust 侧自带 supervisor，连接断了会 3s 退避重连，所以这里不做重连逻辑。
+ */
+class SyncService : Service(), BridgeListener {
+
+    @Volatile
+    private var started = false
+
+    override fun onCreate() {
+        super.onCreate()
+        Notifier.ensureChannels(this)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 必须第一时间 startForeground，否则 5s 内会被系统判 ANR/崩溃
+        startForeground(Notifier.FG_ID, Notifier.serviceNotification(this, BridgeState.state.value))
+
+        if (intent?.action == Prefs.ACTION_STOP) {
+            Native.nativeStop()
+            started = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val prefs = Prefs(this)
+        if (!prefs.isConfigured) {
+            Log.w(TAG, "no peer configured, service stops")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (!started) startBridge(prefs)
+        return START_STICKY
+    }
+
+    private fun startBridge(prefs: Prefs) {
+        started = true
+        val dir = filesDir.absolutePath
+        val peer = prefs.peerId
+        val relay = prefs.relay
+        // 建端点会阻塞几秒（等 relay online），不能占主线程
+        Thread({
+            val ok = runCatching { Native.nativeStart(dir, peer, relay, this) }.getOrDefault(false)
+            if (!ok) {
+                started = false
+                BridgeState.set("error:启动失败")
+                Notifier.updateService(this, "error:启动失败")
+            }
+        }, "bridge-start").start()
+    }
+
+    override fun onClipText(seq: Long, text: String) {
+        BridgeState.lastSeq.value = seq
+        BridgeState.push(ClipItem(seq = seq, text = text))
+        Notifier.showText(this, seq, text)
+    }
+
+    override fun onState(state: String) {
+        BridgeState.set(state)
+        Notifier.updateService(this, state)
+    }
+
+    override fun onDestroy() {
+        Native.nativeStop()
+        started = false
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    companion object {
+        private const val TAG = "SyncService"
+
+        fun start(context: Context) {
+            context.startForegroundService(Intent(context, SyncService::class.java))
+        }
+
+        fun stop(context: Context) {
+            context.startService(
+                Intent(context, SyncService::class.java).setAction(Prefs.ACTION_STOP)
+            )
+        }
+    }
+}

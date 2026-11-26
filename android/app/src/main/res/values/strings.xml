@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ClipBridge</string>
+    <string name="tile_label">发到电脑</string>
+    <string name="shortcut_clip_short">发剪贴板</string>
+    <string name="shortcut_clip_long">发送剪贴板到电脑</string>
+    <string name="shortcut_file_short">发文件</string>
+    <string name="shortcut_file_long">发送文件到电脑</string>
+</resources>

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_clip"
+        android:shortcutId="send_clip"
+        android:shortcutLongLabel="@string/shortcut_clip_long"
+        android:shortcutShortLabel="@string/shortcut_clip_short">
+        <intent
+            android:action="top.ieop.clipbridge.SEND_CLIP"
+            android:targetClass="top.ieop.clipbridge.QuickSendActivity"
+            android:targetPackage="top.ieop.clipbridge" />
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_file"
+        android:shortcutId="send_file"
+        android:shortcutLongLabel="@string/shortcut_file_long"
+        android:shortcutShortLabel="@string/shortcut_file_short">
+        <intent
+            android:action="top.ieop.clipbridge.SEND_FILE"
+            android:targetClass="top.ieop.clipbridge.QuickSendActivity"
+            android:targetPackage="top.ieop.clipbridge" />
+    </shortcut>
+
+</shortcuts>

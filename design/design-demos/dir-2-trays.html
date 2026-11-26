@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ClipBridge · 方向2 双面收发台</title>
+<style>
+  :root{
+    --paper:#EFE9DC; --paper2:#F7F3E9; --ink:#16150F; --sub:#6B6555;
+    --rule:#C4BBAA; --red:#BE3D24; --blue:#24486E; --green:#3F6B4F;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#DCD4C3;color:var(--ink);font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  .serif{font-family:"Georgia","Songti SC","SimSun",serif}
+  .mono{font-family:Consolas,"SF Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+  .board{width:1960px;min-height:1120px;padding:40px 52px 30px;background:
+    linear-gradient(180deg,#E9E2D3 0%, #E2DAC9 100%);}
+  header{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:2px solid var(--ink);padding-bottom:14px}
+  .kicker{font-size:10px;letter-spacing:.26em;color:var(--sub)}
+  h1{font-size:44px;font-weight:400;letter-spacing:.06em;margin-top:8px}
+  h1 em{font-style:normal;color:var(--red)}
+  .lede{width:460px;font-size:12px;line-height:2;color:var(--sub);text-align:right}
+  .lede strong{color:var(--ink);font-weight:600}
+  .stage{display:flex;gap:44px;margin-top:30px;align-items:flex-start}
+  .caption{font-size:9px;letter-spacing:.24em;color:var(--sub);margin-bottom:9px}
+
+  /* 手机 */
+  .phone{width:392px;border-radius:34px;background:#1A1813;padding:8px;box-shadow:0 30px 60px -34px #2A2418,0 0 0 1px #B8AE99}
+  .screen{border-radius:28px;overflow:hidden;background:var(--paper2);height:832px;display:flex;flex-direction:column}
+  .sb{display:flex;justify-content:space-between;padding:14px 24px 4px;font-size:11px;color:#5B5546}
+  .sb .r{display:flex;gap:5px;align-items:center}
+  .bat{width:20px;height:9px;border:1px solid #5B5546;border-radius:2px;position:relative}
+  .bat i{position:absolute;inset:2px;right:8px;background:#3F6B4F}
+
+  .head{padding:16px 24px 14px}
+  .head .who{display:flex;align-items:baseline;justify-content:space-between}
+  .head h2{font-size:21px;font-weight:400;letter-spacing:.08em}
+  .head .link{font-size:10px;color:var(--green);letter-spacing:.04em}
+  .spine{margin:12px 24px 0;height:1px;background:var(--rule);position:relative}
+  .spine::before,.spine::after{content:"";position:absolute;top:-3px;width:7px;height:7px;border-radius:50%;background:var(--ink)}
+  .spine::before{left:0}.spine::after{right:0}
+  .spine .mid{position:absolute;left:50%;top:-9px;transform:translateX(-50%);font-size:9px;background:var(--paper2);padding:0 8px;color:var(--sub);letter-spacing:.1em}
+
+  .tray{padding:16px 24px 0}
+  .tray .th{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
+  .tray .th span{font-size:9px;letter-spacing:.2em;color:var(--sub)}
+  .tray .th b{font-size:11px;font-weight:600;letter-spacing:.04em}
+  .tray.down .th b{color:var(--blue)}
+  .tray.up .th b{color:var(--red)}
+  .item{padding:10px 0;border-bottom:1px solid var(--rule)}
+  .item .t{font-size:13px;line-height:1.5}
+  .item .m{display:flex;justify-content:space-between;margin-top:5px;font-size:9px;color:var(--sub);letter-spacing:.06em}
+  .item.file .t{display:flex;align-items:center;gap:8px}
+  .fdoc{width:16px;height:19px;border:1px solid var(--rule);background:#fff;position:relative}
+  .fdoc::after{content:"PNG";position:absolute;bottom:-1px;right:-1px;font-size:5px;background:var(--ink);color:var(--paper2);padding:1px}
+  .upzone{margin:16px 24px 0;border:1px dashed #B9AF9C;padding:14px 16px;display:flex;align-items:center;justify-content:space-between}
+  .upzone span{font-size:11px;color:var(--sub)}
+  .upzone b{font-size:11px;color:var(--red);letter-spacing:.06em}
+  .footnote{margin-top:auto;padding:14px 24px 28px;font-size:9px;letter-spacing:.14em;color:var(--sub);text-align:center}
+
+  /* Windows */
+  .win{width:1010px;background:var(--paper2);border:1px solid #B9AF9C;box-shadow:0 36px 70px -40px #4A422F}
+  .tb{height:34px;background:#E5DDCB;border-bottom:1px solid #C6BCA7;display:flex;align-items:center;padding:0 12px;gap:10px}
+  .tb .t{font-size:11px;letter-spacing:.2em;color:#4E4735}
+  .tb .sp{flex:1}
+  .tb .c{width:28px;height:22px;display:grid;place-items:center;color:#6B6555;font-size:11px}
+  .top{padding:16px 18px 12px;border-bottom:2px solid var(--ink);display:flex;align-items:flex-end;gap:16px}
+  .top h3{font-size:17px;font-weight:400;letter-spacing:.1em}
+  .top .q{margin-left:auto;width:250px;height:26px;border-bottom:1px solid var(--ink);font-size:11px;color:#6B6453;display:flex;align-items:center}
+  .cols{display:flex}
+  .col{flex:1;padding:0}
+  .col.left{border-right:1px solid var(--rule)}
+  .colh{display:flex;justify-content:space-between;padding:10px 18px;font-size:9px;letter-spacing:.2em;border-bottom:1px solid var(--rule);color:var(--sub)}
+  .col.left .colh b{color:var(--blue)} .col.right .colh b{color:var(--red)}
+  .r{padding:11px 18px;border-bottom:1px solid #E3DBC9;display:flex;gap:12px}
+  .r time{font-size:10px;color:#6B6453;width:44px;flex:none;padding-top:2px}
+  .r .c{font-size:12px;line-height:1.5}
+  .r .c em{display:block;font-style:normal;font-size:9px;color:#6B6453;margin-top:3px;letter-spacing:.05em}
+  .spinecol{width:64px;display:flex;flex-direction:column;align-items:center;background:
+    repeating-linear-gradient(180deg,transparent 0 27px,#DED6C4 27px 28px)}
+  .spinecol .node{width:26px;height:26px;border:1px solid var(--ink);border-radius:50%;display:grid;place-items:center;font-size:8px;letter-spacing:.06em;background:var(--paper2);margin-top:20px}
+  .spinecol .lab{font-size:8px;color:var(--sub);letter-spacing:.12em;margin-top:6px;writing-mode:horizontal-tb}
+  .spinecol .mid{margin-top:auto;margin-bottom:18px;font-size:9px;color:var(--green);letter-spacing:.1em;text-align:center}
+  .foot{display:flex;gap:16px;padding:8px 18px;border-top:1px solid var(--ink);font-size:10px;color:var(--sub);align-items:center}
+  .foot .k{margin-left:auto;display:flex;gap:5px}
+  .foot .k span{border:1px solid #C6BCA7;padding:1px 5px;font-size:9px;color:#5B5546}
+  .notes{display:flex;gap:24px;margin-top:26px;padding-top:14px;border-top:1px solid #C6BCA7;font-size:10px;color:#6B6555;line-height:1.9}
+  .notes b{color:var(--ink);font-weight:600}
+  .notes div{max-width:400px}
+</style>
+</head>
+<body>
+<div class="board">
+  <header>
+    <div>
+      <div class="kicker">CLIPBRIDGE / DIRECTION 02</div>
+      <h1>双面<em>收发台</em></h1>
+    </div>
+    <div class="lede"><strong>一台机器上两只托盘</strong>：上面接电脑来的，下面接要发出去的。
+    中间那条线就是连接本身——断线时它变成虚线，不用去设置里翻状态。</div>
+  </header>
+
+  <div class="stage">
+    <div style="display:flex;gap:24px">
+      <div>
+        <div class="caption">手机 · 主屏</div>
+        <div class="phone"><div class="screen">
+          <div class="sb"><span class="mono">9:41</span><div class="r"><span class="mono" style="font-size:9px">5G</span><span class="bat"><i></i></span></div></div>
+
+          <div class="head">
+            <div class="who"><h2 class="serif">收发台</h2><span class="link">● 已连 PC-LUOXINGYUAN · 12ms</span></div>
+          </div>
+          <div class="spine"><span class="mid serif">直连</span></div>
+
+          <div class="tray down">
+            <div class="th"><b>来自电脑</b><span>98 条 · 7 未读</span></div>
+            <div class="item"><div class="t">transformer 的设计稿拆成三段：方向、版式、验收标准，晚点一起过</div>
+              <div class="m"><span>14:32 · VS Code</span><span class="mono">1.2 KB</span></div></div>
+            <div class="item file"><div class="t"><span class="fdoc"></span>screenshot-2026-11-26.png</div>
+              <div class="m"><span>13:47 · 资源管理器</span><span class="mono">2.1 MB</span></div></div>
+            <div class="item"><div class="t">https://github.com/alchaincyf/huashu-design</div>
+              <div class="m"><span>14:05 · Chrome</span><span class="mono">0.1 KB</span></div></div>
+            <div class="item"><div class="t">cargo build --release -p clipbridge 2&gt;&amp;1 | tail -4</div>
+              <div class="m"><span>12:58 · Windows Terminal</span><span class="mono">0.1 KB</span></div></div>
+            <div class="item"><div class="t">周五设计评审：19:00，会议室 A</div>
+              <div class="m"><span>11:40 · 飞书</span><span class="mono">0.2 KB</span></div></div>
+          </div>
+
+          <div class="tray up">
+            <div class="th"><b>发往电脑</b><span>30 条 · 已送达</span></div>
+            <div class="item"><div class="t">会议纪要：周五前提交 APK 测试包</div>
+              <div class="m"><span>14:28 · 微信</span><span>✓ 已写入</span></div></div>
+            <div class="item"><div class="t">晚点再对一下 relay 端口</div>
+              <div class="m"><span>13:20 · 短信</span><span>✓ 已写入</span></div></div>
+            <div class="item"><div class="t">设计稿我看完了，第二节再压一点</div>
+              <div class="m"><span>11:12 · 快捷方式</span><span>✓ 已写入</span></div></div>
+            <div class="upzone"><span>长按桌面图标即可发送剪贴板</span><b>长按 →</b></div>
+          </div>
+
+          <div class="footnote serif">本机历史 · 12 天 · 128 条</div>
+        </div></div>
+      </div>
+
+      <div>
+        <div class="caption">手机 · 托盘展开（单条动作）</div>
+        <div class="phone"><div class="screen" style="background:#F2EDDF">
+          <div class="sb"><span class="mono">9:41</span><div class="r"><span class="bat"><i></i></span></div></div>
+          <div style="padding:20px 24px;border-bottom:1px solid var(--rule)">
+            <div style="font-size:9px;letter-spacing:.2em;color:var(--sub)">来自电脑 · VS CODE</div>
+            <div class="serif" style="font-size:17px;line-height:1.75;margin-top:12px">transformer 的设计稿拆成三段：方向、版式、验收标准，晚点一起过</div>
+          </div>
+          <div style="padding:16px 24px;font-size:10px;color:var(--sub);line-height:2.1">
+            <div style="display:flex;justify-content:space-between"><span>写入时间</span><span class="mono">2026-11-26 14:32:08</span></div>
+            <div style="display:flex;justify-content:space-between"><span>体积</span><span class="mono">1.2 KB</span></div>
+            <div style="display:flex;justify-content:space-between"><span>序号</span><span class="mono">#128</span></div>
+          </div>
+          <div style="margin:18px 24px 0;border-top:1px solid var(--rule);padding-top:12px">
+            <div style="font-size:9px;letter-spacing:.2em;color:var(--sub);margin-bottom:8px">同一通道 · 前后两条</div>
+            <div style="font-size:11px;line-height:1.6;padding:8px 0;border-bottom:1px solid #E3DBC9;color:#4E4735">↑ 14:28　会议纪要：周五前提交 APK 测试包</div>
+            <div style="font-size:11px;line-height:1.6;padding:8px 0;color:#4E4735">↓ 14:05　https://github.com/alchaincyf/huashu-design</div>
+          </div>
+
+          <div style="margin:26px 24px 0;background:#EFE7D6;padding:12px 14px;border-left:2px solid var(--red)">
+            <div style="font-size:9px;letter-spacing:.16em;color:var(--sub)">这条文本</div>
+            <div style="font-size:11px;color:#3E3827;line-height:1.8;margin-top:4px">还没写进手机剪贴板。点上面的按钮才写，避免覆盖你正在粘的东西。</div>
+          </div>
+
+          <div style="margin-top:auto;padding:0 24px 28px">
+            <div style="height:46px;background:var(--ink);color:var(--paper2);display:grid;place-items:center;font-size:13px;letter-spacing:.1em">复制到剪贴板</div>
+            <div style="margin-top:8px;display:flex;gap:8px">
+              <div style="flex:1;height:38px;border:1px solid var(--ink);display:grid;place-items:center;font-size:11px;letter-spacing:.06em">发回电脑</div>
+              <div style="flex:1;height:38px;border:1px solid var(--rule);display:grid;place-items:center;font-size:11px;color:var(--sub)">删除</div>
+            </div>
+          </div>
+        </div></div>
+      </div>
+    </div>
+
+    <div style="flex:1">
+      <div class="caption">Windows · 历史窗口（左右两栏 = 两只托盘）</div>
+      <div class="win">
+        <div class="tb"><span class="t">CLIPBRIDGE · 收发台</span><span class="sp"></span><span class="c">—</span><span class="c">□</span><span class="c">×</span></div>
+        <div class="top"><h3 class="serif">今日 128 条</h3>
+          <div class="q">⌕ 搜索内容 / 来源</div>
+        </div>
+        <div class="cols">
+          <div class="col left">
+            <div class="colh"><b>电脑 → 手机 98</b><span>未读 7</span></div>
+            <div class="r"><time class="mono">14:32</time><div class="c">transformer 的设计稿拆成三段：方向、版式、验收标准，晚点一起过<em>VS Code · 1.2 KB</em></div></div>
+            <div class="r"><time class="mono">14:05</time><div class="c">https://github.com/alchaincyf/huashu-design<em>Chrome · 0.1 KB</em></div></div>
+            <div class="r"><time class="mono">13:47</time><div class="c">screenshot-2026-11-26.png<em>资源管理器 · 2.1 MB</em></div></div>
+            <div class="r"><time class="mono">12:58</time><div class="c">cargo build --release -p clipbridge<em>Windows Terminal · 0.1 KB</em></div></div>
+            <div class="r"><time class="mono">11:40</time><div class="c">周五设计评审：19:00，会议室 A<em>飞书 · 0.2 KB</em></div></div>
+            <div class="r"><time class="mono">10:22</time><div class="c">把 architecture.md 的第 16 节补上 M1 修订<em>Typora · 0.6 KB</em></div></div>
+            <div class="r"><time class="mono">09:14</time><div class="c">relay 留空，走 N0 自动发现<em>VS Code · 0.1 KB</em></div></div>
+          </div>
+          <div class="spinecol">
+            <div class="node">PC</div><div class="lab">12ms</div>
+            <div class="mid">直连<br>保活</div>
+          </div>
+          <div class="col right">
+            <div class="colh"><b>手机 → 电脑 30</b><span>已写盘</span></div>
+            <div class="r"><time class="mono">14:28</time><div class="c">会议纪要：周五前提交 APK 测试包<em>微信 · 0.3 KB</em></div></div>
+            <div class="r"><time class="mono">13:20</time><div class="c">晚点再对一下 relay 端口<em>短信 · 0.2 KB</em></div></div>
+            <div class="r"><time class="mono">11:12</time><div class="c">设计稿我看完了，第二节再压一点<em>剪贴板快捷方式 · 0.4 KB</em></div></div>
+            <div class="r"><time class="mono">09:31</time><div class="c">D:\ClipBridge\inbox 收到了吗<em>微信 · 0.1 KB</em></div></div>
+            <div class="r"><time class="mono">09:02</time><div class="c">文件：screenshot-2026-11-26.png<em>分享面板 · 2.1 MB</em></div></div>
+            <div class="r"><time class="mono">08:47</time><div class="c">早，先把文案定下来<em>快捷方式 · 0.1 KB</em></div></div>
+          </div>
+        </div>
+        <div class="foot"><span style="color:var(--green)">● 监听中</span><span>队列 0</span><span>托盘在线</span><span class="mono">D:\ClipBridge\inbox</span>
+          <div class="k"><span>Ctrl+Alt+H</span><span>Enter 复制</span><span>Del 删除</span><span>清空</span></div></div>
+      </div>
+
+      <div style="display:flex;gap:16px;margin-top:18px">
+        <div style="width:300px;background:var(--paper2);border:1px solid #B9AF9C;padding:10px 0 6px">
+          <div style="padding:0 14px 8px;font-size:9px;letter-spacing:.2em;color:var(--sub)">托盘菜单</div>
+          <div style="padding:9px 14px;font-size:12px;display:flex;justify-content:space-between;background:#E8E0CF">打开收发台<span class="mono" style="font-size:9px;color:#6B6453">Ctrl+Alt+H</span></div>
+          <div style="padding:9px 14px;font-size:12px;color:#4E4735;display:flex;justify-content:space-between">暂停监听<span style="font-size:9px;color:var(--green)">开</span></div>
+          <div style="padding:9px 14px;font-size:12px;color:#4E4735;display:flex;justify-content:space-between">开机自启<span style="font-size:9px;color:var(--green)">已开</span></div>
+          <div style="padding:9px 14px;font-size:12px;color:#6B6453;display:flex;justify-content:space-between">退出</div>
+        </div>
+        <div style="flex:1;background:var(--paper2);border:1px solid #B9AF9C;padding:14px">
+          <div style="font-size:9px;letter-spacing:.2em;color:var(--sub);margin-bottom:8px">通知 · 手机端</div>
+          <div style="font-size:12px;font-weight:600">来自电脑 · 已复制</div>
+          <div style="font-size:11px;color:#6B6555;line-height:1.7;margin-top:4px">transformer 的设计稿拆成三段…<br><span style="font-size:9px;color:#6B6453">VS Code · 14:32 · 点「复制」即可粘</span></div>
+        </div>
+      </div>
+
+      <div class="notes">
+        <div><b>借的机制</b>：邮件客户端把「收件 / 发件」拆成两条独立时间线的做法——同一份数据，两个视角各自成立。</div>
+        <div><b>form 来自内容</b>：两侧设备各有自己的时钟和节奏，所以不收成一条混合流，而是并列两条，中间那条线代表连接本身。</div>
+        <div><b>克制处</b>：无图标、无阴影、无卡片，只有一张纸、一条细线、一个印色。</div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+
+

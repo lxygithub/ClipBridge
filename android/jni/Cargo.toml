@@ -1,0 +1,15 @@
+[package]
+name = "clipbridge-android"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "clipbridge_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+iroh.workspace = true
+clipbridge-core = { path = "../../core" }
+jni = "0.21"
