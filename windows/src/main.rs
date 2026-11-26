@@ -192,7 +192,7 @@ async fn serve_net(
     dir: PathBuf,
 ) -> Result<()> {
     let ep = net::build_endpoint(secret).await?;
-    let peers: Peers = Arc::new(Mutex::new(HashMap::new()));
+    let peers: Peers = Arc::new(AsyncMutex::new(HashMap::new()));
     let pending: Pendings = Arc::new(Mutex::new(HashMap::new()));
     let inbox = dir.join("inbox");
     let _ = std::fs::create_dir_all(&inbox);

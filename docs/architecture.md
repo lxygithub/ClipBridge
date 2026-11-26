@@ -172,6 +172,7 @@ ALPN：`clipbridge/1`
 | `0x14` | `FILE_PAUSE` | 双向 | `{id, offset}`，接收方落盘后停写 |
 | `0x15` | `FILE_RESUME` | 双向 | `{id, offset}`，新开流从 offset 续传 |
 | `0x16` | `FILE_CANCEL` | 双向 | `{id}`，双方删 `.part` 并清理状态 |
+| `0x17` | `FILE_DATA` | 双向 | 数据面流首帧，payload = transfer id 的 hex（32 字符），其后是裸文件字节。M2 实现时补的编号，不改动 0x01–0x16 |
 | `0x20` | `ACK` | 双向 | `{seq}` / `{id, ok}` |
 | `0x21` | `PING` / `PONG` | 双向 | 空 |
 | `0x30` | `SYNC_REQ` | A→W | `{since_seq}`，请求补发 |

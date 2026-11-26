@@ -31,7 +31,8 @@ ClipBridge 的取舍：**服务器架在 Windows 上，手机主动拨号**，�
 | 收到文本只发 LOW 通知，不自动写剪贴板；打开 app 不自动上传剪贴板 | ✅ |
 | 桌面图标长按 / 分享面板 / 快捷设置磁贴 三个发送入口 | ✅ |
 | 手机端界面（设计稿方向 3「一条通道」） | ✅ |
-| 文件双向传输（`.part` + 暂停/续传，单文件 ≤ 2GB） | ⬜ 进行中 |
+| 文件传输：Windows 端收发（`.part` + SHA256 校验 + 同名不覆盖 + ≤2GB 校验）+ `send-file` 命令 | ✅ |
+| 文件传输：手机端收发、暂停/恢复/取消 UI | ⬜ 进行中 |
 | 图片剪贴板 | ⬜ |
 | 手机端历史持久化 / 多台电脑配对 | ⬜ |
 | Windows 历史窗口自绘（当前仍是原生 EDIT/LISTBOX） | ⬜ |
@@ -108,6 +109,13 @@ Gradle 不读 Windows 系统代理，走代理时在 `android/gradle.properties`
 4. 手机发文本：长按桌面图标选「发送剪贴板」、任意 app 里分享、或下拉点磁贴
 5. 电脑端 `Ctrl+Alt+H` 打开历史窗口
 
+发文件（当前 Windows 端已可用，手机端待接）：
+
+```powershell
+clipbridge.exe send-file --peer <对方 ID> --file D:\path\to\big.zip
+# 对方落盘到 <dir>\inbox\，SHA256 校验通过后才改名，同名自动加 " (1)"
+```
+
 ## 已知限制
 
 - Android 10+ 后台读不到剪贴板，所以手机侧只能由用户动作触发（设计如此，不是缺陷）
@@ -129,6 +137,9 @@ cargo run -p clipbridge -- recv --peer <ID> # 模拟手机端，看广播与补�
 - [x] M1 文本双向 + Windows 常驻界面
 - [x] 手机端方向 3 界面 + 内置配对 ID
 - [ ] M2 文件双向传输（`FILE_OFFER/ACCEPT/PAUSE/RESUME/CANCEL`，`.part` 落盘，≤2GB）
+  - [x] core：报价/接受/完成 payload、`.part` 落盘、SHA256、同名去重、CHUNK 流式
+  - [x] Windows：接收（`inbox/` 落盘）+ `clipbridge send-file --peer <ID> --file <路径>`
+  - [ ] Android：JNI 回调 + 后台落盘 + 进度通知（暂停/取消）
 - [ ] M3 图片剪贴板（DIB → PNG，缩略图通知）
 - [ ] M4 手机端历史持久化、多台电脑配对
 - [ ] M5 Windows 历史窗口自绘，与手机端同一套视觉

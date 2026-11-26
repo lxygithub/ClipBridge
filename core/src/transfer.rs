@@ -262,7 +262,14 @@ pub async fn recv_stream(
             ST_PAUSE => break,
             _ => {}
         }
-        let n = recv.read(&mut buf).await.unwrap_or(0);
+        let n = match recv.read(&mut buf).await {
+            Ok(Some(n)) => n,
+            Ok(None) => break,
+            Err(err) => {
+                eprintln!("[transfer] read error at {written}: {err:#}");
+                break;
+            }
+        };
         if n == 0 {
             break;
         }
@@ -277,3 +284,4 @@ pub async fn recv_stream(
     drop(file);
     Ok(written)
 }
+
