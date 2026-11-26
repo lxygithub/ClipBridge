@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, WHITE_BRUSH};
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateFontW, CreateSolidBrush, HBRUSH, HDC, SetBkColor, SetTextColor,
+};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -47,6 +49,54 @@ const CMD_QUIT: usize = 2004;
 const CLASS_NAME: &str = "ClipBridgeWnd";
 const TRAY_UID: u32 = 1;
 const HOTKEY_ID: i32 = 1;
+
+// 和手机端「一条通道」同一套色板；COLORREF 是 0x00BBGGRR，别写反
+const C_BG: u32 = 0x0015_0E07; // #070E15
+const C_PANEL: u32 = 0x001C_140B; // #0B141C
+const C_INK: u32 = 0x00F2_EBE4; // #E4EBF2
+const C_DIM: u32 = 0x00B3_A496; // #96A4B3
+
+/// 窗口与控件共用的暗底画刷（进程生命周期内复用）。
+static BG_BRUSH: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+static UI_FONT: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+fn bg_brush() -> HBRUSH {
+    let raw = *BG_BRUSH.get_or_init(|| unsafe { CreateSolidBrush(C_BG) as isize });
+    raw as *mut core::ffi::c_void
+}
+
+unsafe fn ui_font() -> WPARAM {
+    *UI_FONT.get_or_init(|| {
+        // 10pt 微软雅黑：中文清晰，行距也比默认字体松
+        let face = wide("Microsoft YaHei UI");
+        CreateFontW(
+            16,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1u32,
+            0,
+            0,
+            0,
+            0u32,
+            face.as_ptr(),
+        ) as isize
+    }) as WPARAM
+}
+
+#[link(name = "uxtheme")]
+extern "system" {
+    fn SetWindowTheme(hwnd: HWND, app: *const u16, id: *const u16) -> i32;
+}
+
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(hwnd: HWND, attr: u32, pv: *const core::ffi::c_void, cb: u32) -> i32;
+}
 
 pub struct HistoryItem {
     pub seq: u64,
@@ -117,7 +167,7 @@ pub fn run(app: Arc<App>) -> Result<()> {
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = hinst;
         wc.hCursor = LoadCursorW(ptr::null_mut(), IDC_ARROW);
-        wc.hbrBackground = GetStockObject(WHITE_BRUSH) as _;
+        wc.hbrBackground = bg_brush() as _;
         wc.lpszClassName = class.as_ptr();
         RegisterClassExW(&wc);
 
@@ -167,6 +217,7 @@ pub fn run(app: Arc<App>) -> Result<()> {
         app.hist_hwnd.store(hist as isize, Ordering::Relaxed);
 
         create_controls(hist);
+        darken(hist);
         layout(hist);
         refresh_list(&app, hist);
 
@@ -276,6 +327,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
+            // 内置控件默认浅色，这里统一压成暗底浅字
+            let hdc = wp as HDC;
+            SetBkColor(hdc, C_BG);
+            SetTextColor(hdc, C_INK);
+            bg_brush() as LRESULT        }
         WM_CLOSE => {
             // 历史窗口只隐藏；消息窗口才是退出入口
             if is_hist {
@@ -294,7 +351,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 unsafe fn create_controls(hwnd: HWND) {
-    let font = GetStockObject(DEFAULT_GUI_FONT) as WPARAM;
+    let font = ui_font();
     let make = |class: &str, style: u32, id: i32| -> HWND {
         let c = wide(class);
         let t = wide("");
@@ -334,6 +391,24 @@ unsafe fn create_controls(hwnd: HWND) {
     set_text(GetDlgItem(hwnd, ID_DELETE), "删除");
     set_text(GetDlgItem(hwnd, ID_CLEAR), "清空");
     set_text(GetDlgItem(hwnd, ID_STATUS), "监听中");
+}
+
+/// 暗色化：标题栏 + 各控件滚动条 + 编辑框/列表背景。
+unsafe fn darken(hwnd: HWND) {
+    // DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 1809+ 用 19，两个都试一次）
+    let on: u32 = 1;
+    let p = &on as *const u32 as *const core::ffi::c_void;
+    if DwmSetWindowAttribute(hwnd, 20, p, 4) != 0 {
+        DwmSetWindowAttribute(hwnd, 19, p, 4);
+    }
+
+    let dark = wide("DarkMode_Explorer");
+    for id in [ID_SEARCH, ID_LIST] {
+        let ctl = GetDlgItem(hwnd, id);
+        if !ctl.is_null() {
+            SetWindowTheme(ctl, dark.as_ptr(), ptr::null());
+        }
+    }
 }
 
 unsafe fn set_text(hwnd: HWND, text: &str) {
@@ -651,4 +726,8 @@ fn civil_md(z: i64) -> (u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (m, d)
 }
+
+
+
+
 
