@@ -1,5 +1,5 @@
-//! ClipBridge Windows 端（M1：剪贴板监听 + 多设备广播 + 断连补发 + 托盘/热键/历史窗口）。
-//!
+#![cfg_attr(windows, windows_subsystem = "windows")]
+//! ClipBridge Windows 端（M1：剪贴板监听 + 多设备广播 + 断连补发 + 托盘/热键/历史窗口）。//!
 //! 用法：
 //!   clipbridge info
 //!   clipbridge serve                        常驻：托盘 + 剪贴板推送 + Ctrl+Alt+H 历史窗口
@@ -112,6 +112,8 @@ fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
+    // 先定输出出口再谈别的：GUI 子系统下没有控制台，println 写失败会 panic
+    setup_stdio(&cli.dir, matches!(&cli.cmd, Cmd::Serve { headless: true, .. }));
     let key_path = cli.dir.join("endpoint.key");
     let secret = net::load_or_create_secret(&key_path)?;
 
@@ -257,53 +259,82 @@ fn deliver_complete(completions: &Completions, payload: &[u8]) {
     }
 }
 
-/// 托盘模式脱离控制台：进程不再附着在控制台窗口上，用户关掉那个窗口就不会带走托盘。
-///
-/// 脱离之后 stdout 句柄失效，而 `println!` 写失败会 panic，所以顺手把
-/// stdout/stderr 重定向到 `dir/serve.log`：托盘模式的输出不留白，出了问题还有得看。
+/// 把 stdout/stderr 钉到指定目标（追加写文件，或已存在的控制台）。
 #[cfg(windows)]
-fn detach_console(dir: &Path) {
+unsafe fn rebind_std(name: &std::ffi::OsStr, append: bool) {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_ALWAYS,
+        OPEN_ALWAYS, OPEN_EXISTING,
     };
+    use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    wide.push(0);
+    let (access, disposition) = if append {
+        (FILE_APPEND_DATA, OPEN_ALWAYS)
+    } else {
+        (GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING)
+    };
+    let handle = CreateFileW(
+        wide.as_ptr(),
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        std::ptr::null(),
+        disposition,
+        FILE_ATTRIBUTE_NORMAL,
+        std::ptr::null_mut(),
+    );
+    if handle as isize == -1 {
+        return;
+    }
+    SetStdHandle(STD_OUTPUT_HANDLE, handle);
+    SetStdHandle(STD_ERROR_HANDLE, handle);
+}
+
+/// 进程出口统一在这里定：release 版是 GUI 子系统，双击不会再闪黑窗口。
+///
+/// 代价是没有控制台，而 `println!` 写失败会 panic，所以要先决定输出去哪：
+/// - 已经被重定向到文件/管道（父进程给的句柄有效）：保持原样，别动
+/// - headless 且从终端启动：附着父控制台，日志照常打在终端里
+/// - 其余（托盘双击、开机自启、`serve` 非 headless）：脱离控制台 + 追加写 `<dir>/serve.log`
+///
+/// 托盘模式必须脱离，否则那个挂在进程上的控制台窗口一关，Windows 会发
+/// CTRL_CLOSE_EVENT 把整个托盘带走。
+#[cfg(windows)]
+fn setup_stdio(dir: &Path, headless: bool) {
+    use std::ffi::OsStr;
     use windows_sys::Win32::System::Console::{
-        FreeConsole, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        AttachConsole, FreeConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
     };
 
     unsafe {
-        FreeConsole();
-
-        let mut wide: Vec<u16> = dir.join("serve.log").as_os_str().encode_wide().collect();
-        wide.push(0);
-        let handle = CreateFileW(
-            wide.as_ptr(),
-            FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        );
-        // INVALID_HANDLE_VALUE = -1；拿不到文件就退回 NUL，至少别让后续 println 砸了进程
-        if handle as isize == -1 {
+        let std_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if !std_handle.is_null() && std_handle as isize != -1 {
             return;
         }
-        SetStdHandle(STD_OUTPUT_HANDLE, handle);
-        SetStdHandle(STD_ERROR_HANDLE, handle);
+        if !headless {
+            FreeConsole();
+            rebind_std(dir.join("serve.log").as_os_str(), true);
+            return;
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            rebind_std(OsStr::new("CONOUT$"), false);
+            return;
+        }
+        rebind_std(dir.join("serve.log").as_os_str(), true);
     }
 }
+
+#[cfg(not(windows))]
+fn setup_stdio(_dir: &Path, _headless: bool) {}
 
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOptions) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
     let app = Arc::new(ui::App::new(Arc::clone(&store)));
 
-    // 托盘模式先脱离控制台，否则那个黑窗口一关，Windows 就给附着进程发 CTRL_CLOSE_EVENT，
-    // 托盘跟着一起没了。headless 模式要留着控制台看日志，不脱。
-    if !headless {
-        detach_console(&dir);
-    }
+    // 输出出口已经在 main 里的 setup_stdio 定好了（脱离控制台 / 落 serve.log / 贴终端）
 
     // 让自启命令写得回正确目录
     std::env::set_var("CLIPBRIDGE_DIR", dir.display().to_string());
