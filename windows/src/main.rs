@@ -257,9 +257,53 @@ fn deliver_complete(completions: &Completions, payload: &[u8]) {
     }
 }
 
+/// 托盘模式脱离控制台：进程不再附着在控制台窗口上，用户关掉那个窗口就不会带走托盘。
+///
+/// 脱离之后 stdout 句柄失效，而 `println!` 写失败会 panic，所以顺手把
+/// stdout/stderr 重定向到 `dir/serve.log`：托盘模式的输出不留白，出了问题还有得看。
+#[cfg(windows)]
+fn detach_console(dir: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_ALWAYS,
+    };
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        FreeConsole();
+
+        let mut wide: Vec<u16> = dir.join("serve.log").as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        // INVALID_HANDLE_VALUE = -1；拿不到文件就退回 NUL，至少别让后续 println 砸了进程
+        if handle as isize == -1 {
+            return;
+        }
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+}
+
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOptions) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
     let app = Arc::new(ui::App::new(Arc::clone(&store)));
+
+    // 托盘模式先脱离控制台，否则那个黑窗口一关，Windows 就给附着进程发 CTRL_CLOSE_EVENT，
+    // 托盘跟着一起没了。headless 模式要留着控制台看日志，不脱。
+    if !headless {
+        detach_console(&dir);
+    }
 
     // 让自启命令写得回正确目录
     std::env::set_var("CLIPBRIDGE_DIR", dir.display().to_string());
