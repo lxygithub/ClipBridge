@@ -56,8 +56,10 @@ const CLASS_NAME: &str = "ClipBridgeWnd";
 const TRAY_UID: u32 = 1;
 const HOTKEY_ID: i32 = 1;
 
-// 版面：标题 0..56，两块热区 62..148，列表标题 160..180，条目从这里开始
-const LIST_TOP: i32 = 196;
+// 版面：标题 0..56，两块热区 62..148，发送目标行 152..178，列表标题 200..222，条目从这里开始
+const LIST_TOP: i32 = 230;
+const PEER_TOP: i32 = 152;
+const PEER_H: i32 = 24;
 const ROW_H: i32 = 46;
 const ROW_GAP: i32 = 6;
 const ROW_STRIDE: i32 = ROW_H + ROW_GAP;
@@ -166,13 +168,24 @@ pub struct Row {
     pub meta: String,
 }
 
+/// 一台连上来的手机：id 是 EndpointId，name 来自它的 HELLO（还没收到名字时为空）。
+#[derive(Clone, Default)]
+pub struct PeerSlot {
+    pub id: String,
+    pub name: String,
+}
+
 pub struct App {
     pub store: Arc<Store>,
     items: Mutex<Vec<HistoryItem>>,
     rows: Mutex<Vec<Row>>,
     link: Mutex<LinkInfo>,
-    /// 已连接设备（手机）的显示名，来自手机 HELLO；用来在标题下和列表行里标"发送给/来自 xxx"
-    peer_name: Mutex<String>,
+    /// 连着的所有手机（网络线程每 2 秒同步一次）
+    peers: Mutex<Vec<PeerSlot>>,
+    /// 连过的 EndpointId → 名字（名字可能比连接晚到，先记着）
+    peer_names: Mutex<std::collections::HashMap<String, String>>,
+    /// 只发给这一台；None = 广播给全部
+    target: Mutex<Option<String>>,
     inbox: PathBuf,
     outbox: PathBuf,
     /// 剪贴板图片落地目录（`in_`/`out_` 前缀区分收发的方向）
@@ -212,7 +225,9 @@ impl App {
             items: Mutex::new(items),
             rows: Mutex::new(Vec::new()),
             link: Mutex::new(LinkInfo::default()),
-            peer_name: Mutex::new(String::new()),
+            peers: Mutex::new(Vec::new()),
+            peer_names: Mutex::new(std::collections::HashMap::new()),
+            target: Mutex::new(None),
             inbox: dir.join("inbox"),
             outbox: dir.join("outbox"),
             images: dir.join("images"),
@@ -320,29 +335,133 @@ impl App {
         }
     }
 
-    /// 手机连上来时报上自己的名字；变了就重绘（标题下的设备名 + 列表行的「发送给/来自」都要跟着变）。
-    pub fn set_peer_name(&self, name: String) {
-        let name = name.trim().to_string();
-        if name.is_empty() {
+    /// 手机连上来时报上自己的名字。按 EndpointId 记，多台手机互不覆盖。
+    pub fn learn_peer_name(&self, id: &str, name: &str) {
+        let name = name.trim();
+        if id.is_empty() || name.is_empty() {
             return;
         }
         let changed = {
-            let mut cur = self.peer_name.lock().unwrap();
-            let changed = *cur != name;
-            *cur = name;
-            changed
+            let mut names = self.peer_names.lock().unwrap();
+            names.insert(id.to_string(), name.to_string()).as_deref() != Some(name)
         };
         if changed {
+            self.sync_peer_names();
             self.refresh();
         }
     }
 
+    /// 网络线程每 2 秒把「当前连着的手机」同步过来（顺序按 id，稳定不乱跳）。
+    pub fn set_peers(&self, mut list: Vec<PeerSlot>) {
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        let changed = {
+            let mut cur = self.peers.lock().unwrap();
+            let same = cur.len() == list.len()
+                && cur.iter().zip(list.iter()).all(|(a, b)| a.id == b.id && a.name == b.name);
+            if same {
+                false
+            } else {
+                *cur = list;
+                true
+            }
+        };
+        if changed {
+            // 选中的那台断开了就退回「全部」，否则界面显示发了却没人收
+            let mut target = self.target.lock().unwrap();
+            if let Some(t) = target.as_ref() {
+                let alive = self.peers.lock().unwrap().iter().any(|p| &p.id == t);
+                if !alive {
+                    *target = None;
+                }
+            }
+            drop(target);
+            self.refresh();
+        }
+    }
+
+    fn sync_peer_names(&self) {
+        let names = self.peer_names.lock().unwrap().clone();
+        let mut peers = self.peers.lock().unwrap();
+        for p in peers.iter_mut() {
+            if p.name.is_empty() {
+                if let Some(n) = names.get(&p.id) {
+                    p.name = n.clone();
+                }
+            }
+        }
+    }
+
+    pub fn peer_slots(&self) -> Vec<PeerSlot> {
+        self.sync_peer_names();
+        self.peers.lock().unwrap().clone()
+    }
+
+    /// 当前发送目标：None = 全部在线设备。
+    pub fn target_peer(&self) -> Option<String> {
+        self.target.lock().unwrap().clone()
+    }
+
+    /// 点选目标设备（None = 全部）。
+    pub fn set_target(&self, id: Option<String>) {
+        let mut t = self.target.lock().unwrap();
+        if *t == id {
+            return;
+        }
+        *t = id;
+        drop(t);
+        // 行的「发给 xxx」跟着变
+        let hwnd = self.hist_hwnd.load(Ordering::Relaxed);
+        if hwnd != 0 {
+            unsafe { PostMessageW(hwnd as HWND, WM_APP_REFRESH, 0, 0) };
+        }
+    }
+
+    /// 列表行与副标题用的对端标签：选了单台就是它的名字，否则「全部设备」。
     fn peer_label(&self) -> String {
-        let name = self.peer_name.lock().unwrap().clone();
-        if name.is_empty() {
-            "手机".to_string()
-        } else {
-            name
+        let peers = self.peer_slots();
+        let target = self.target_peer();
+        let pick = |p: &PeerSlot| -> String {
+            if p.name.is_empty() {
+                format!("手机 · {}…", &p.id[..8.min(p.id.len())])
+            } else {
+                p.name.clone()
+            }
+        };
+        if let Some(t) = target.as_ref() {
+            if let Some(p) = peers.iter().find(|p| &p.id == t) {
+                return pick(p);
+            }
+        }
+        match peers.len() {
+            0 => "手机".to_string(),
+            1 => pick(&peers[0]),
+            n => format!("全部设备（{n} 台）"),
+        }
+    }
+
+    /// 收到的条目用：广播模式下没法知道具体是哪台发的，就写「手机」。
+    fn peer_label_in(&self) -> String {
+        let peers = self.peer_slots();
+        if let Some(t) = self.target_peer() {
+            if let Some(p) = peers.iter().find(|p| p.id == t) {
+                return if p.name.is_empty() {
+                    format!("手机 · {}…", &p.id[..8.min(p.id.len())])
+                } else {
+                    p.name.clone()
+                };
+            }
+        }
+        match peers.len() {
+            0 => "手机".to_string(),
+            1 => {
+                let p = &peers[0];
+                if p.name.is_empty() {
+                    format!("手机 · {}…", &p.id[..8.min(p.id.len())])
+                } else {
+                    p.name.clone()
+                }
+            }
+            _ => "手机".to_string(),
         }
     }
 
@@ -679,6 +798,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     send_clipboard(&*app, hwnd);
                 } else if hit(&file_r, pt) {
                     pick_file(&*app);
+                } else if let Some(sel) = peer_chip_at(&*app, rc.right, pt) {
+                    (*app).set_target(sel);
                 } else if hit(&log_chip_rect(rc.right), pt) {
                     let next = if (*app).page() == 0 { 1 } else { 0 };
                     (*app).set_page(next);
@@ -734,6 +855,74 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 fn hit(rc: &RECT, pt: POINT) -> bool {
     pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
+}
+
+/// 发送目标那一行的胶囊几何：第一枚是「全部」，后面每台手机一枚。
+/// 宽度按字符估（ASCII 7px、中文 12px），够用了——不做精确排版。
+fn peer_chips(app: &App, width: i32) -> Vec<(Option<String>, String, RECT)> {
+    let mut out = Vec::new();
+    let peers = app.peer_slots();
+    if peers.is_empty() {
+        return out;
+    }
+    let mut x = 84;
+    if peers.len() > 1 {
+        let label = "全部";
+        let w = 16 + chip_text_w(label);
+        out.push((
+            None,
+            label.to_string(),
+            RECT {
+                left: x,
+                top: PEER_TOP,
+                right: x + w,
+                bottom: PEER_TOP + PEER_H,
+            },
+        ));
+        x += w + 6;
+    }
+    for p in peers.iter() {
+        let label = if p.name.is_empty() {
+            format!("{}…", &p.id[..8.min(p.id.len())])
+        } else if p.name.chars().count() > 10 {
+            format!("{}…", p.name.chars().take(10).collect::<String>())
+        } else {
+            p.name.clone()
+        };
+        let w = 16 + chip_text_w(&label);
+        if x + w > width - 16 {
+            break;
+        }
+        out.push((
+            Some(p.id.clone()),
+            label,
+            RECT {
+                left: x,
+                top: PEER_TOP,
+                right: x + w,
+                bottom: PEER_TOP + PEER_H,
+            },
+        ));
+        x += w + 6;
+    }
+    out
+}
+
+fn chip_text_w(s: &str) -> i32 {
+    s.chars()
+        .map(|c| if c.is_ascii() { 7 } else { 12 })
+        .sum::<i32>()
+        .max(14)
+}
+
+/// 点中的是哪一枚：`Some(None)` = 全部，`Some(Some(id))` = 指定手机，`None` = 没点这里。
+fn peer_chip_at(app: &App, width: i32, pt: POINT) -> Option<Option<String>> {
+    for (id, _, rc) in peer_chips(app, width) {
+        if hit(&rc, pt) {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// 顶部一张卡片，左右两半：左半粘贴文本（接 Ctrl+V），右半选择文件。
@@ -1003,6 +1192,89 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         "也可以把文件拖进窗口",
         false,
     );
+
+    // 发送目标：连着多台手机时给胶囊选择（默认「全部」广播），只连一台就只做说明
+    let peers = app.peer_slots();
+    let target = app.target_peer();
+    text_in(
+        hdc,
+        "发给",
+        RECT {
+            left: 18,
+            top: PEER_TOP,
+            right: 84,
+            bottom: PEER_TOP + PEER_H,
+        },
+        small_font(),
+        C_FAINT,
+        DT_SINGLELINE | DT_VCENTER,
+    );
+    if peers.len() <= 1 {
+        text_in(
+            hdc,
+            &format!("{}（{}）", app.peer_label(), if peers.is_empty() { "未连接" } else { "唯一在线设备" }),
+            RECT {
+                left: 66,
+                top: PEER_TOP,
+                right: w - 16,
+                bottom: PEER_TOP + PEER_H,
+            },
+            small_font(),
+            if peers.is_empty() { C_FAINT } else { C_DIM },
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    } else {
+        for (id, label, rc) in peer_chips(app, w) {
+            let on = match (&id, &target) {
+                (None, None) => true,
+                (Some(i), Some(t)) => i == t,
+                _ => false,
+            };
+            fill_round(
+                hdc,
+                rc,
+                if on { 0x002B_4314 } else { C_PANEL },
+                if on { C_TEAL } else { C_BORDER },
+                PEER_H,
+            );
+            text_in(
+                hdc,
+                &label,
+                rc,
+                small_font(),
+                if on { 0x00A6_E37B } else { C_DIM },
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+            );
+        }
+        let hint = match &target {
+            None => "广播给全部在线设备".to_string(),
+            Some(id) => {
+                let name = peers
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    format!("只发给 {}", &id[..8.min(id.len())])
+                } else {
+                    format!("只发给 {name}")
+                }
+            }
+        };
+        text_in(
+            hdc,
+            &hint,
+            RECT {
+                left: 18,
+                top: PEER_TOP + PEER_H + 2,
+                right: w - 16,
+                bottom: PEER_TOP + PEER_H + 16,
+            },
+            small_font(),
+            C_FAINT,
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
 
     // 列表标题（两页共用同一块列表区）
     let log_page = app.page() == 1;
@@ -1417,6 +1689,7 @@ unsafe fn draw_folder_big(hdc: HDC, x: i32, y: i32, color: u32) {
 unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
     let log_page = app.page() == 1;
     let peer = app.peer_label();
+    let peer_in = app.peer_label_in();
     let mut rows: Vec<Row> = Vec::new();
 
     for it in app.items.lock().unwrap().iter() {
@@ -1483,7 +1756,7 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                         if outgoing {
                             format!("发给 {peer}")
                         } else {
-                            format!("来自 {peer}")
+                            format!("来自 {peer_in}")
                         }
                     ),
                 });
@@ -1536,7 +1809,7 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                     if outgoing {
                         format!("发给 {peer}")
                     } else {
-                        format!("来自 {peer}")
+                        format!("来自 {peer_in}")
                     },
                     fmt_time(mtime)
                 ),

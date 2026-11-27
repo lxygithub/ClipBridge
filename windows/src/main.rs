@@ -427,6 +427,7 @@ async fn serve_net(
     let _ = std::fs::create_dir_all(&outbox);
     tokio::spawn(watch_outbox(
         Arc::clone(&peers),
+        Arc::clone(&app),
         Arc::clone(&outgoing),
         Arc::clone(&completions),
         outbox.clone(),
@@ -478,6 +479,18 @@ async fn serve_net(
                     }
                 }
                 app.set_link(info);
+
+                // 顺手把「连着的手机」同步给 UI：副标题、发送目标胶囊、行的「发给 xxx」都靠它
+                let slots = {
+                    let map = peers.lock().await;
+                    map.keys()
+                        .map(|id| ui::PeerSlot {
+                            id: id.to_string(),
+                            name: String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                };
+                app.set_peers(slots);
             }
         });
     }
@@ -515,7 +528,8 @@ async fn serve_net(
                     }
                 };
 
-                let conns: Vec<Connection> = peers.lock().await.values().cloned().collect();
+                // 只发「发送目标」选中的那台；没选就是广播（旧行为）
+                let conns = target_conns(&peers, &app).await;
                 if conns.is_empty() {
                     println!("[clip] no peer online, queued");
                     continue;
@@ -626,7 +640,7 @@ async fn serve_net(
                 }
             });
             if let Err(err) =
-                handle_conn(conn, store, pending, outgoing, completions, inbox, app_h).await
+                handle_conn(conn, id.to_string(), store, pending, outgoing, completions, inbox, app_h).await
             {
                 eprintln!("[conn] {err:#}");
             }
@@ -639,6 +653,7 @@ async fn serve_net(
 
 async fn handle_conn(
     conn: Connection,
+    peer_id: String,
     store: Arc<Store>,
     pending: Pendings,
     outgoing: Outgoing,
@@ -658,6 +673,7 @@ async fn handle_conn(
         let completions = Arc::clone(&completions);
         let inbox = inbox.clone();
         let app = Arc::clone(&app);
+        let peer_id = peer_id.clone();
         tokio::spawn(async move {
             let Ok(Some((ty, payload))) = protocol::read_frame(&mut recv).await else {
                 return;
@@ -674,8 +690,8 @@ async fn handle_conn(
                     let name = body.split('|').nth(2).unwrap_or("").trim().to_string();
                     println!("[hello] since #{last_seq} from {}", if name.is_empty() { "?" } else { &name });
                     if !name.is_empty() {
-                        // 手机名进 UI：标题徽标与列表行都要显示「发送给 / 来自 xxx」
-                        app.set_peer_name(name);
+                        // 手机名按 EndpointId 记：两台手机各显示各的名字，不会互相覆盖
+                        app.learn_peer_name(&peer_id, &name);
                     }
                     match store.since(last_seq) {
                         Ok(items) => {
@@ -834,6 +850,20 @@ async fn handle_conn(
 }
 
 /// 开一条新流推一条文本。
+/// 按「发送目标」过滤在线连接：没选目标 = 全部广播；选了就只留那一台。
+async fn target_conns(peers: &Peers, app: &std::sync::Arc<ui::App>) -> Vec<Connection> {
+    let target = app.target_peer();
+    let guard = peers.lock().await;
+    guard
+        .iter()
+        .filter(|(id, _)| match &target {
+            None => true,
+            Some(t) => &id.to_string() == t,
+        })
+        .map(|(_, conn)| conn.clone())
+        .collect()
+}
+
 async fn push_text(conn: Connection, seq: u64, text: &str) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("open stream")?;
     let payload = format!("{seq}|{text}");
@@ -1196,6 +1226,7 @@ async fn send_file(
 /// 取消：传输中把 outbox 里的源文件删掉即可；被对端取消的落到 `outbox/cancelled/`，不再重试。
 async fn watch_outbox(
     peers: Peers,
+    app: Arc<ui::App>,
     outgoing: Outgoing,
     completions: Completions,
     outbox: PathBuf,
@@ -1215,7 +1246,7 @@ async fn watch_outbox(
             if !path.is_file() {
                 continue;
             }
-            let conns: Vec<Connection> = peers.lock().await.values().cloned().collect();
+            let conns = target_conns(&peers, &app).await;
             if conns.is_empty() {
                 continue;
             }
