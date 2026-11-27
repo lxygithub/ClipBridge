@@ -269,6 +269,11 @@ impl Session {
         out
     }
 
+    /// 把过期的地址缓存删掉，下一次连接回到 DNS / pkarr 发现。
+    fn drop_addrs(&self) {
+        let _ = std::fs::remove_file(self.dir.join("peer_addrs.json"));
+    }
+
     /// 连上之后把这个对端现在可用的地址记下来，下次重连直接用。
     fn save_addrs(&self, conn: &Connection) {
         let mut relay = String::new();
@@ -752,6 +757,9 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
 /// 一直连不上再慢慢放长，别在没网的时候把无线一直叫醒。
 async fn supervise(sess: Arc<Session>) {
     let mut backoff = Duration::from_secs(1);
+    // 连续失败次数：缓存里的直连 IP:端口 在电脑重启后会失效（端口每次都变），
+    // 连着两次连不上就把缓存扔掉，下一次走完整的发现流程，别一直对着废地址撞 12 秒超时。
+    let mut fails = 0u32;
     loop {
         // 会话被换掉（nativeStart 重建 / nativeStop）之后这个循环就该退出，
         // 否则老会话会拿着已经关掉的 endpoint 一直重连，和新会话抢同一个 key。
@@ -764,6 +772,7 @@ async fn supervise(sess: Arc<Session>) {
             Ok(conn) => {
                 log_line(&sess.dir, "connect: ok");
                 sess.save_addrs(&conn);
+                fails = 0;
                 if let Err(err) = sess.hello(&conn).await {
                     eprintln!("[jni] hello failed: {err:#}");
                     log_line(&sess.dir, &format!("hello failed: {err:#}"));
@@ -776,6 +785,12 @@ async fn supervise(sess: Arc<Session>) {
             Err(err) => {
                 log_line(&sess.dir, &format!("connect: failed {err:#}"));
                 sess.state("disconnected");
+                fails += 1;
+                if fails >= 2 {
+                    sess.drop_addrs();
+                    log_line(&sess.dir, "connect: stale addrs dropped, fallback to discovery");
+                    fails = 0;
+                }
                 false
             }
         };
