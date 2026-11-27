@@ -208,6 +208,12 @@ private fun ChannelScreen(
                 if (name.isNotBlank() && peerId.isNotBlank()) prefs.rememberPeer(peerId, name)
                 val raw = runCatching { Native.nativeListFiles() }.getOrDefault("[]")
                 BridgeState.files.value = parseFiles(raw)
+                // 状态是「已连接」，但 Rust 侧很久没确认过链路活着（或多进程已经换了会话）：
+                // 这就是「手机显示连着、电脑端早就没了」的那种假连接，直接翻成未连接。
+                val idle = runCatching { Native.nativeIdleMs() }.getOrDefault(-1L)
+                if (idle > STALE_LINK_MS && BridgeState.state.value == "connected") {
+                    BridgeState.state.value = "disconnected"
+                }
             }
             delay(2000)
         }
@@ -532,6 +538,9 @@ private fun NodeCard(
 
 /// 链路徽标：直连/中继 + RTT；颜色按 60ms / 160ms 分档（与桌面端同一套语义）。
 private data class LinkChip(val text: String, val fg: Color, val bg: Color)
+
+/** 超过这么久没确认过链路活着，就当它已经断了（后台心跳 20s 一轮，留一倍余量）。 */
+private const val STALE_LINK_MS = 45_000L
 
 private fun linkChip(link: String, connected: Boolean): LinkChip {
     if (!connected) {
