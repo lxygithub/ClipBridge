@@ -217,6 +217,46 @@ type Pendings = Arc<Mutex<HashMap<String, Pending>>>;
 /// 正在往外发的传输：id → 控制位，收到对端 `FILE_CANCEL` 时用来踩刹车。
 type Outgoing = Arc<Mutex<HashMap<String, Arc<transfer::TransferFlags>>>>;
 
+/// 谁在等某个文件 id 的 `FILE_COMPLETE`。
+///
+/// 对端校验完会**单开一条流**把 COMPLETE 发回来，而一条 QUIC 连接上只能有一个
+/// `accept_bi()` 的拥有者：以前 `handle_conn` 和 `push_file` 各自去抢，抢输的那个
+/// 把 COMPLETE 当未知帧丢掉（对端日志里的 `unsupported type 0x13`），发送方等 60 秒
+/// 超时后被判定"未送达"，于是 outbox 又整份重发一遍。
+/// 现在统一由 `handle_conn` 收帧，按 id 投递给正在等的发送方。
+type Completions = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<transfer::Complete>>>>;
+
+/// push_file 中途取消/出错时把 completions 里的槽位收回来，避免表里堆垃圾。
+struct CompletionSlot<'a> {
+    map: &'a Completions,
+    id: String,
+}
+
+impl Drop for CompletionSlot<'_> {
+    fn drop(&mut self) {
+        self.map.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// 把一条 COMPLETE 帧交还给等它的发送方；等不到人（迟到/对端先关连接）就只记一行日志。
+fn deliver_complete(completions: &Completions, payload: &[u8]) {
+    match serde_json::from_slice::<transfer::Complete>(payload) {
+        Ok(done) => {
+            let waiter = completions.lock().unwrap().remove(&done.id);
+            match waiter {
+                Some(tx) => {
+                    let _ = tx.send(done);
+                }
+                None => println!(
+                    "[file] 收到没有等待者的 COMPLETE {}",
+                    &done.id[..8.min(done.id.len())]
+                ),
+            }
+        }
+        Err(err) => eprintln!("[file] bad COMPLETE: {err:#}"),
+    }
+}
+
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOptions) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
     let app = Arc::new(ui::App::new(Arc::clone(&store)));
@@ -271,6 +311,7 @@ async fn serve_net(
     let peers: Peers = Arc::new(AsyncMutex::new(HashMap::new()));
     let pending: Pendings = Arc::new(Mutex::new(HashMap::new()));
     let outgoing: Outgoing = Arc::new(Mutex::new(HashMap::new()));
+    let completions: Completions = Arc::new(Mutex::new(HashMap::new()));
     let inbox = dir.join("inbox");
     let _ = std::fs::create_dir_all(&inbox);
     let outbox = dir.join("outbox");
@@ -278,6 +319,7 @@ async fn serve_net(
     tokio::spawn(watch_outbox(
         Arc::clone(&peers),
         Arc::clone(&outgoing),
+        Arc::clone(&completions),
         outbox.clone(),
         outbox.join("sent"),
     ));
@@ -348,6 +390,7 @@ async fn serve_net(
         let pending = Arc::clone(&pending);
         let outgoing = Arc::clone(&outgoing);
         let inbox = inbox.clone();
+        let completions = Arc::clone(&completions);
     let ep_for_peer = ep.clone();
         tokio::spawn(async move {
             let Ok(accepting) = incoming.accept() else { return };
@@ -376,7 +419,7 @@ async fn serve_net(
                     println!("[peer] {} 还没拿到候选地址", id.fmt_short());
                 }
             });
-            if let Err(err) = handle_conn(conn, store, pending, outgoing, inbox).await {
+            if let Err(err) = handle_conn(conn, store, pending, outgoing, completions, inbox).await {
                 eprintln!("[conn] {err:#}");
             }
             peers.lock().await.remove(&id);
@@ -391,6 +434,7 @@ async fn handle_conn(
     store: Arc<Store>,
     pending: Pendings,
     outgoing: Outgoing,
+    completions: Completions,
     inbox: PathBuf,
 ) -> Result<()> {
     loop {
@@ -402,6 +446,7 @@ async fn handle_conn(
         let conn2 = conn.clone();
         let pending = Arc::clone(&pending);
         let outgoing = Arc::clone(&outgoing);
+        let completions = Arc::clone(&completions);
         let inbox = inbox.clone();
         tokio::spawn(async move {
             let Ok(Some((ty, payload))) = protocol::read_frame(&mut recv).await else {
@@ -522,6 +567,12 @@ async fn handle_conn(
                         flags.cancel();
                         println!("[file] peer canceled outgoing {}", &id);
                     }
+                }
+                protocol::MSG_FILE_COMPLETE => {
+                    // 对端（可能是正在收我们发的文件的设备）校验完的回执。它只认 id，
+                    // 具体交给哪个发送任务由 completions 决定。
+                    deliver_complete(&completions, &payload);
+                    let _ = send.finish();
                 }
                 protocol::MSG_PING => {
                     let _ = protocol::write_frame(&mut send, protocol::MSG_PING, b"").await;
@@ -703,7 +754,12 @@ fn spawn_path_probe(
 /// 在一条已有连接上推一个文件：OFFER → ACCEPT → 数据流 → 等 COMPLETE。
 ///
 /// 既被 CLI 用（自己拨号），也被 `outbox` 监视用（复用手机拨进来的那条连接）。
-async fn push_file(conn: &Connection, path: &Path, outgoing: &Outgoing) -> Result<()> {
+async fn push_file(
+    conn: &Connection,
+    path: &Path,
+    outgoing: &Outgoing,
+    completions: &Completions,
+) -> Result<()> {
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     anyhow::ensure!(meta.is_file(), "not a file");
     let size = meta.len();
@@ -763,6 +819,14 @@ async fn push_file(conn: &Connection, path: &Path, outgoing: &Outgoing) -> Resul
     }
 
     // 2) 数据面；控制位登记到 outgoing，供对端 FILE_CANCEL 踩刹车
+    //    等 COMPLETE 的槽位必须赶在发数据之前挂上：对端可能在我们发完最后一块、
+    //    还没走到"等待"那一步时就把回执发回来了，晚一步就漏掉。
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    completions.lock().unwrap().insert(id.clone(), done_tx);
+    let _slot = CompletionSlot {
+        map: completions,
+        id: id.clone(),
+    };
     let flags = Arc::new(transfer::TransferFlags::new());
     // 用户把 outbox 里的源文件删掉 = 取消这一笔。
     // 注意不能靠 watch_outbox 的 read_dir 判：文件删了就不再出现在目录列表里，
@@ -812,23 +876,21 @@ async fn push_file(conn: &Connection, path: &Path, outgoing: &Outgoing) -> Resul
     // 3) 等对端校验结果。**必须拿到 COMPLETE 才算送达**：
     //    之前超时后直接当成功，于是数据其实没到齐（跨网 relay 丢包）的文件也被挪进 sent/，
     //    从此再也不重试。现在改成失败返回，outbox 会用稳定 id 从 .part 续传补齐。
-    match tokio::time::timeout(Duration::from_secs(60), conn.accept_bi()).await {
-        Ok(Ok((_s, mut r))) => {
-            if let Ok(Some((protocol::MSG_FILE_COMPLETE, payload))) = protocol::read_frame(&mut r).await
-            {
-                let done: transfer::Complete = serde_json::from_slice(&payload)?;
-                println!(
-                    "{} 校验 {} · {} bytes · sha256 {}",
-                    if done.ok { "✓ 已完成" } else { "✗ 失败" },
-                    if done.ok { "通过" } else { "不通过" },
-                    done.size,
-                    &done.sha256[..8.min(done.sha256.len())]
-                );
-                anyhow::ensure!(done.ok, "peer reported failure");
-            }
-        }
-        _ => anyhow::bail!("no COMPLETE from peer (data may be incomplete, will resume)"),
-    }
+    //    回执由 handle_conn 收（它是这条连接上 accept_bi() 的唯一拥有者）再投递过来。
+    let done: transfer::Complete = match tokio::time::timeout(Duration::from_secs(60), done_rx).await
+    {
+        Ok(Ok(done)) => done,
+        Ok(Err(_)) => anyhow::bail!("COMPLETE 通道已关闭"),
+        Err(_) => anyhow::bail!("no COMPLETE from peer (data may be incomplete, will resume)"),
+    };
+    println!(
+        "{} 校验 {} · {} bytes · sha256 {}",
+        if done.ok { "✓ 已完成" } else { "✗ 失败" },
+        if done.ok { "通过" } else { "不通过" },
+        done.size,
+        &done.sha256[..8.min(done.sha256.len())]
+    );
+    anyhow::ensure!(done.ok, "peer reported failure");
     Ok(())
 }
 
@@ -843,7 +905,27 @@ async fn send_file(
     let ep = net::build_endpoint(secret).await?;
     let conn = ep.connect(addr, ALPN).await.context("connect failed")?;
     let outgoing: Outgoing = Arc::new(Mutex::new(HashMap::new()));
-    push_file(&conn, &path, &outgoing).await?;
+    let completions: Completions = Arc::new(Mutex::new(HashMap::new()));
+    // 这条连接只用来发文件，但仍然需要唯一的 accept_bi() 拥有者：
+    // 否则 CLI 发送也会和 push_file 抢 COMPLETE 那条流（抢输就判"未送达"）。
+    {
+        let conn = conn.clone();
+        let completions = Arc::clone(&completions);
+        tokio::spawn(async move {
+            while let Ok((mut s, mut r)) = conn.accept_bi().await {
+                let completions = Arc::clone(&completions);
+                tokio::spawn(async move {
+                    if let Ok(Some((protocol::MSG_FILE_COMPLETE, payload))) =
+                        protocol::read_frame(&mut r).await
+                    {
+                        deliver_complete(&completions, &payload);
+                    }
+                    let _ = s.finish();
+                });
+            }
+        });
+    }
+    push_file(&conn, &path, &outgoing, &completions).await?;
     conn.close(0u32.into(), b"done");
     ep.close().await;
     Ok(())
@@ -852,7 +934,13 @@ async fn send_file(
 /// `outbox/` 监视：放进去的文件会被推给所有在线设备，成功后移到 `outbox/sent/`。
 ///
 /// 取消：传输中把 outbox 里的源文件删掉即可；被对端取消的落到 `outbox/cancelled/`，不再重试。
-async fn watch_outbox(peers: Peers, outgoing: Outgoing, outbox: PathBuf, sent: PathBuf) {
+async fn watch_outbox(
+    peers: Peers,
+    outgoing: Outgoing,
+    completions: Completions,
+    outbox: PathBuf,
+    sent: PathBuf,
+) {
     let _ = std::fs::create_dir_all(&sent);
     let cancelled = outbox.join("cancelled");
     let _ = std::fs::create_dir_all(&cancelled);
@@ -873,7 +961,7 @@ async fn watch_outbox(peers: Peers, outgoing: Outgoing, outbox: PathBuf, sent: P
             }
             let mut all_ok = true;
             for conn in conns {
-                if let Err(err) = push_file(&conn, &path, &outgoing).await {
+                if let Err(err) = push_file(&conn, &path, &outgoing, &completions).await {
                     let text = format!("{err:#}");
                     eprintln!("[outbox] {text}");
                     if text.contains("canceled by peer") {
