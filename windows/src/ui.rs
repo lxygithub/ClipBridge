@@ -2390,7 +2390,16 @@ unsafe fn send_clipboard(app: &App, hwnd: HWND) {
             }
             None => app.set_hint("这张图转 PNG 失败"),
         },
-        None => app.set_hint("剪贴板里没有文字或图片"),
+        None => {
+            // 读不出图时把剪贴板里现有的格式打到日志里，下次一看就知道是谁的格式没吃下
+            let fmts = clipimg::describe_formats();
+            println!("[clip] 没有可用的图，剪贴板格式: {fmts}");
+            if fmts == "剪贴板被占用" {
+                app.set_hint("剪贴板被别的程序占用，稍后再试");
+            } else {
+                app.set_hint("剪贴板里的图片格式不认识，换个方式复制再试");
+            }
+        }
     }
     let _ = hwnd;
 }

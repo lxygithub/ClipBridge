@@ -9,14 +9,16 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, SetStretchBltMode,
-    StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, HDC, SRCCOPY,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDIBits, GetObjectW,
+    SelectObject, SetStretchBltMode, StretchBlt, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_BITFIELDS,
+    BI_RGB, DIB_RGB_COLORS, HALFTONE, HDC, SRCCOPY,
 };
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardFormatNameW,
+    OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GHND};
-use windows_sys::Win32::System::Ole::CF_DIB;
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GHND};
+use windows_sys::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5};
 
 /// 剪贴板里的图：RGBA（自上而下，每像素 4 字节）。
 pub struct Bitmap {
@@ -25,79 +27,275 @@ pub struct Bitmap {
     pub h: u32,
 }
 
-/// 读 `CF_DIB`。只认 24/32bpp、未压缩的 DIB——微信/浏览器/截图工具都发这个格式，
-/// 8bpp 调色板图和 RLE 压缩图直接放弃（转出来也是花的）。
+/// 读剪贴板里的图。按「信息量从高到低」依次试四种格式：
+/// 1. 注册格式 `PNG`（浏览器截图、Snipaste 这类会直接给 PNG 字节，无损且不用猜 DIB 头）；
+/// 2. `CF_DIB`（绝大多数程序的默认图格式，可能是 8/16/24/32bpp 或 BI_BITFIELDS）；
+/// 3. `CF_DIBV5`（带 alpha 掩码的 V5 头，Office/Photoshop 走这条）；
+/// 4. `CF_BITMAP`（最后兜底：扔给 GDI 的 GetDIBits 转成 32bpp，什么压缩都能读）。
 pub unsafe fn read_clipboard() -> Option<Bitmap> {
     if OpenClipboard(std::ptr::null_mut()) == 0 {
         return None;
     }
-    let handle = GetClipboardData(CF_DIB as u32);
-    if handle.is_null() {
-        CloseClipboard();
-        return None;
-    }
-    let base = GlobalLock(handle) as *const u8;
-    if base.is_null() {
-        CloseClipboard();
-        return None;
-    }
-    let out = parse_dib(base);
-    GlobalUnlock(handle);
+    let out = read_png()
+        .or_else(|| read_dib(CF_DIB as u32))
+        .or_else(|| read_dib(CF_DIBV5 as u32))
+        .or_else(|| read_bitmap());
     CloseClipboard();
     out
 }
 
-/// DIB 头 + 像素 → RGBA。抽出来单独实现，方便以后加 BITFIELDS。
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 剪贴板里现在有哪些格式（只用于诊断日志：读图失败时打出来，好知道是谁的格式没吃下）。
+pub fn describe_formats() -> String {
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return "剪贴板被占用".to_string();
+        }
+        let mut out = Vec::new();
+        let mut fmt = EnumClipboardFormats(0);
+        while fmt != 0 {
+            let mut buf = [0u16; 128];
+            let n = GetClipboardFormatNameW(fmt, buf.as_mut_ptr(), buf.len() as i32);
+            let name = if n > 0 {
+                String::from_utf16_lossy(&buf[..n as usize])
+            } else {
+                format!("cf#{fmt}")
+            };
+            out.push(name);
+            fmt = EnumClipboardFormats(fmt);
+        }
+        CloseClipboard();
+        out.join(",")
+    }
+}
+
+unsafe fn read_png() -> Option<Bitmap> {
+    let fmt = RegisterClipboardFormatW(wide("PNG").as_ptr());
+    if fmt == 0 {
+        return None;
+    }
+    let h = GetClipboardData(fmt as u32);
+    if h.is_null() {
+        return None;
+    }
+    let size = GlobalSize(h);
+    if size < 8 {
+        return None;
+    }
+    let p = GlobalLock(h) as *const u8;
+    if p.is_null() {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(p, size).to_vec();
+    GlobalUnlock(h);
+    decode_png(&bytes)
+}
+
+unsafe fn read_dib(fmt: u32) -> Option<Bitmap> {
+    let handle = GetClipboardData(fmt);
+    if handle.is_null() {
+        return None;
+    }
+    let base = GlobalLock(handle) as *const u8;
+    if base.is_null() {
+        return None;
+    }
+    let out = parse_dib(base);
+    GlobalUnlock(handle);
+    out
+}
+
+/// 最后兜底：让 GDI 把任何位图（含 RLE、调色板、BITFIELDS）统一转成 32bpp 顶朝下。
+unsafe fn read_bitmap() -> Option<Bitmap> {
+    let hbmp = GetClipboardData(CF_BITMAP as u32);
+    if hbmp.is_null() {
+        return None;
+    }
+    let mut bm: BITMAP = std::mem::zeroed();
+    let n = GetObjectW(
+        hbmp,
+        std::mem::size_of::<BITMAP>() as i32,
+        &mut bm as *mut _ as *mut std::ffi::c_void,
+    );
+    if n == 0 {
+        return None;
+    }
+    let w = bm.bmWidth;
+    let h = bm.bmHeight;
+    if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
+        return None;
+    }
+    let dc = CreateCompatibleDC(std::ptr::null_mut());
+    if dc.is_null() {
+        return None;
+    }
+    let mut info: BITMAPINFO = std::mem::zeroed();
+    info.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: w,
+        biHeight: -h,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB,
+        ..std::mem::zeroed()
+    };
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    let got = GetDIBits(
+        dc,
+        hbmp,
+        0,
+        h as u32,
+        buf.as_mut_ptr() as *mut std::ffi::c_void,
+        &mut info,
+        DIB_RGB_COLORS,
+    );
+    DeleteDC(dc);
+    if got == 0 {
+        return None;
+    }
+    // GetDIBits 给的是 BGRA，且 GDI 常把 alpha 补 0，统一按不透明处理
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for i in 0..(w * h) as usize {
+        rgba[i * 4] = buf[i * 4 + 2];
+        rgba[i * 4 + 1] = buf[i * 4 + 1];
+        rgba[i * 4 + 2] = buf[i * 4];
+        rgba[i * 4 + 3] = 255;
+    }
+    Some(Bitmap {
+        rgba,
+        w: w as u32,
+        h: h as u32,
+    })
+}
+
+/// 按掩码把一个像素通道拉到 0..255（BI_BITFIELDS 里红绿蓝可能不在整字节上）。
+fn chan(v: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 255;
+    }
+    let shift = mask.trailing_zeros();
+    let bits = (mask >> shift).count_ones();
+    if bits == 0 {
+        return 0;
+    }
+    let raw = (v & mask) >> shift;
+    let max = (1u32 << bits) - 1;
+    ((raw * 255 + max / 2) / max) as u8
+}
+
+/// DIB 头 + 像素 → RGBA。认 1/4/8bpp 调色板、16/24/32bpp BI_RGB、32/16bpp BI_BITFIELDS，
+/// 也认 V5 头（掩码在 40..56 偏移处）。RLE 不理，留给 CF_BITMAP 那条兜底。
 unsafe fn parse_dib(base: *const u8) -> Option<Bitmap> {
     let rd_u32 = |off: usize| std::ptr::read_unaligned(base.add(off) as *const u32);
     let rd_i32 = |off: usize| std::ptr::read_unaligned(base.add(off) as *const i32);
+    let rd_u16 = |off: usize| std::ptr::read_unaligned(base.add(off) as *const u16);
     let head = rd_u32(0) as usize;
     if head < 40 {
         return None;
     }
     let w = rd_i32(4);
     let h_raw = rd_i32(8);
-    let bpp = std::ptr::read_unaligned(base.add(14) as *const u16);
+    let bpp = rd_u16(14) as usize;
     let comp = rd_u32(16);
-    if w <= 0 || h_raw == 0 || comp != BI_RGB || (bpp != 24 && bpp != 32) {
+    let clr_used = rd_u32(32) as usize;
+    if w <= 0 || h_raw == 0 || w > 8192 || h_raw.unsigned_abs() > 8192 {
         return None;
     }
     let top_down = h_raw < 0;
     let h = h_raw.unsigned_abs() as usize;
     let w = w as usize;
-    if w > 8192 || h > 8192 {
-        return None;
+
+    // 像素起点：8bpp 及以下跟在调色板后面；BI_BITFIELDS 在 40 字节老头上时，
+    // 三张掩码紧跟在头后面（40..52），像素从 52 开始（.NET / Office 常走这条）
+    let mut src_off = head;
+    if comp == BI_RGB && bpp <= 8 {
+        let n = if clr_used > 0 { clr_used } else { 1usize << bpp };
+        src_off += n * 4;
     }
-    let src = base.add(head);
-    let stride = if bpp == 32 { w * 4 } else { (w * 3 + 3) / 4 * 4 };
+    let stride = ((w * bpp + 31) / 32) * 4;
+    let mut masks = [0u32, 0, 0, 0];
+    if comp == BI_BITFIELDS {
+        if head >= 52 {
+            // V4/V5 头：掩码就在头里
+            masks = [
+                rd_u32(40),
+                rd_u32(44),
+                rd_u32(48),
+                if head >= 56 { rd_u32(52) } else { 0 },
+            ];
+        } else {
+            // 40 字节的老头：掩码外挂
+            masks = [rd_u32(40), rd_u32(44), rd_u32(48), 0];
+            src_off = head + 12;
+        }
+    }
+
     let mut rgba = vec![0u8; w * h * 4];
     let mut any_alpha = false;
     for y in 0..h {
         let row = if top_down { y } else { h - 1 - y };
-        let p = src.add(row * stride);
+        let p = base.add(src_off + row * stride);
         for x in 0..w {
             let o = (y * w + x) * 4;
-            let s = p.add(x * (bpp as usize) / 8);
-            let (b, g, r) = (*s, *s.add(1), *s.add(2));
-            let a = if bpp == 32 {
-                let a = *s.add(3);
-                if a != 0 {
-                    any_alpha = true;
+            match (comp, bpp) {
+                // 24/32bpp 裸 BGRA
+                (BI_RGB, 24) | (BI_RGB, 32) => {
+                    let s = p.add(x * (bpp / 8));
+                    rgba[o] = *s.add(2);
+                    rgba[o + 1] = *s.add(1);
+                    rgba[o + 2] = *s;
+                    let a = if bpp == 32 {
+                        let a = *s.add(3);
+                        if a != 0 {
+                            any_alpha = true;
+                        }
+                        a
+                    } else {
+                        255
+                    };
+                    rgba[o + 3] = a;
                 }
-                a
-            } else {
-                255
-            };
-            rgba[o] = r;
-            rgba[o + 1] = g;
-            rgba[o + 2] = b;
-            rgba[o + 3] = a;
+                // 调色板（1/4/8bpp）
+                (BI_RGB, 1 | 4 | 8) => {
+                    let bit = x * bpp;
+                    let b = *p.add(bit / 8);
+                    let shift = 8 - bpp - (bit % 8);
+                    let idx = ((b as usize) >> shift) & ((1 << bpp) - 1);
+                    let pal = base.add(head + idx * 4);
+                    rgba[o] = *pal.add(2);
+                    rgba[o + 1] = *pal.add(1);
+                    rgba[o + 2] = *pal;
+                    rgba[o + 3] = 255;
+                }
+                // 掩码位图（16bpp 5-6-5、32bpp BGRA/ARGB 都在这）
+                (BI_BITFIELDS, 16) | (BI_BITFIELDS, 32) => {
+                    let v = if bpp == 16 {
+                        std::ptr::read_unaligned(p.add(x * 2) as *const u16) as u32
+                    } else {
+                        std::ptr::read_unaligned(p.add(x * 4) as *const u32)
+                    };
+                    rgba[o] = chan(v, masks[0]);
+                    rgba[o + 1] = chan(v, masks[1]);
+                    rgba[o + 2] = chan(v, masks[2]);
+                    let a = chan(v, masks[3]);
+                    if a != 0 && a != 255 {
+                        any_alpha = true;
+                    }
+                    rgba[o + 3] = a;
+                }
+                _ => return None,
+            }
         }
     }
     // 32bpp 且 alpha 全是 0：多半是没带 alpha 通道的截图，按不透明处理
-    if bpp == 32 && !any_alpha {
+    if !any_alpha {
         for px in rgba.chunks_mut(4) {
-            px[3] = 255;
+            if px[3] == 0 {
+                px[3] = 255;
+            }
         }
     }
     Some(Bitmap {
