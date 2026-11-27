@@ -24,6 +24,22 @@ android {
         )
     }
 
+    // CI 和本机共用同一把 debug key（android/keystore/debug.keystore）：
+    // 换机器出的 APK 也能直接 install -r 覆盖安装，不用先卸载丢历史
+    signingConfigs {
+        create("shared") {
+            storeFile = rootProject.file("keystore/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
+    buildTypes {
+        getByName("debug") { signingConfig = signingConfigs.getByName("shared") }
+        getByName("release") { signingConfig = signingConfigs.getByName("shared") }
+    }
+
     buildFeatures {
         compose = true
         buildConfig = true
