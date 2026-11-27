@@ -11,6 +11,36 @@ mod clipimg;
 mod queue;
 mod ui;
 
+/// UTF-16 宽字符串（Win32 入参用），末尾补 0。
+fn wide(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// 拿命名互斥量做单实例：返回 false 表示已有进程持着。
+/// 句柄会故意泄漏到进程退出——内核会在进程结束时自动释放，不怕残留。
+fn take_single_instance(name: &str) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    unsafe {
+        let h = CreateMutexW(std::ptr::null(), 0, wide(name).as_ptr());
+        if h.is_null() {
+            // 建不出来就别拦用户，宁可多一个实例也别让程序起不来
+            return true;
+        }
+        match WaitForSingleObject(h, 0) {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => true,
+            _ => {
+                CloseHandle(h);
+                false
+            }
+        }
+    }
+}
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -355,6 +385,22 @@ fn rotate_log(_path: &Path) {}
 fn setup_stdio(_dir: &Path, _tray: bool) {}
 
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOptions) -> Result<()> {
+    // 单实例：第二个进程既抢不到 4242（会静默退化成「只有窗口、没有连接」的空壳，
+    // 界面上永远显示「未连接」），又会往同一份 serve.log 里写。这里用内核命名互斥量挡住。
+    if !take_single_instance("ClipBridge-Serve") {
+        eprintln!("[serve] 已有实例在运行（托盘里那个），本次退出");
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+            MessageBoxW(
+                std::ptr::null_mut(),
+                wide("ClipBridge 已经在运行，请看系统托盘里的图标。\n请不要重复启动第二个实例。").as_ptr(),
+                wide("ClipBridge").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        return Ok(());
+    }
+
     let store = Arc::new(Store::open(dir.join("store"))?);
     let app = Arc::new(ui::App::new(Arc::clone(&store), &dir));
 
@@ -379,6 +425,14 @@ fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOp
             };
             if let Err(err) = rt.block_on(serve_net(secret, net_store, net_app, net_dir, net_opts)) {
                 eprintln!("[net] {err:#}");
+                let text = format!("{err:#}");
+                if text.contains("10048") {
+                    eprintln!(
+                        "[net] 端口 4242 被占用：大概率已经有一个 clipbridge 实例在跑，\
+                         这个进程不会再接任何连接（界面就会一直显示「未连接」）。\
+                         请退掉旧实例后只保留一个。"
+                    );
+                }
             }
         })
         .context("spawn net thread")?;
@@ -576,6 +630,7 @@ async fn serve_net(
                 tokio::spawn(async move {
                     if let Ok((mut s, _r)) = hello_conn.open_bi().await {
                         let payload = format!("v1|0|{}", pc_device_name());
+                        println!("[hello-out] → 手机: {payload}");
                         let _ = protocol::write_frame(&mut s, protocol::MSG_HELLO, payload.as_bytes())
                             .await;
                         let _ = s.finish();
