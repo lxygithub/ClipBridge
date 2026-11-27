@@ -8,10 +8,13 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -136,6 +139,27 @@ class MainActivity : ComponentActivity() {
                 }
             )
         }
+    }
+
+    /**
+     * 打开 app 就是最强的恢复信号：进程要是刚被系统杀过，这时候链路一定是断的。
+     * 不等 supervisor 那套退避，直接把会话拆了重建，抢在用户动手之前连上。
+     * 15 秒内只做一次，避免来回切前台把连接反复掐断。
+     */
+    override fun onResume() {
+        super.onResume()
+        if (!prefs.isConfigured) return
+        val state = BridgeState.state.value
+        if (state == "connected" || state == "connecting") return
+        val now = System.currentTimeMillis()
+        if (now - prefs.lastRecover < RECOVER_GAP_MS) return
+        prefs.lastRecover = now
+        SyncService.restart(this)
+    }
+
+    private companion object {
+        /** 两次「进前台就重连」之间的最小间隔 */
+        const val RECOVER_GAP_MS = 15_000L
     }
 
     private fun askNotificationPermission() {
@@ -706,6 +730,26 @@ private fun SettingsDialog(
                         fontSize = 12.sp
                     )
                 )
+                // 保活：允许忽略电池优化，系统才不会在待机几分钟后把前台服务冻住
+                Spacer(Modifier.height(14.dp))
+                val ctx = LocalContext.current
+                val ignoring = runCatching {
+                    ctx.getSystemService(PowerManager::class.java)
+                        ?.isIgnoringBatteryOptimizations(ctx.packageName) == true
+                }.getOrDefault(false)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { if (!ignoring) requestIgnoreBattery(ctx) }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        if (ignoring) "后台保活 · 已允许（忽略电池优化）" else "后台保活 · 未允许，点这里申请",
+                        color = if (ignoring) Palette.teal else Palette.dim,
+                        fontSize = 10.sp
+                    )
+                }
             }
         },
         confirmButton = {
@@ -914,4 +958,21 @@ private fun bitmapToPng(src: Bitmap): ByteArray {
 
 private fun toast(ctx: Context, msg: String) =
     Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+
+/**
+ * 申请「忽略电池优化」：厂商的省电策略最容易杀掉的就是这种常驻前台服务，
+ * 加了白名单之后待机几个小时也不会被冻住。老系统直接跳到电池优化列表页。
+ */
+private fun requestIgnoreBattery(ctx: Context) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+    val pm = ctx.getSystemService(PowerManager::class.java)
+    if (pm?.isIgnoringBatteryOptimizations(ctx.packageName) == true) return
+    val direct = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        .setData(Uri.parse("package:${ctx.packageName}"))
+    runCatching { ctx.startActivity(direct) }.onFailure {
+        runCatching {
+            ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+    }
+}
 

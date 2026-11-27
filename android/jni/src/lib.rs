@@ -272,11 +272,14 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
         }
     });
 
-    // 心跳：每 10s 探一次活，靠电脑端把 PING 原样回回来判断链路是否真的活着。
+    // 心跳：每 20s 探一次活，靠电脑端把 PING 原样回回来判断链路是否真的活着。
     // 这一步不能省：电脑端进程被关掉（或换了新实例）时，这条 QUIC 连接会变成半开，
     // 手机侧读流不会立刻报错，UI 就一直显示「已连接」，而电脑端早就不认识这条连接了
     // —— 用户看到的就是「手机说连着、电脑说没连」。
-    let mut hb = tokio::time::interval(std::time::Duration::from_secs(10));
+    //
+    // 间隔 20s 是为了省电：QUIC 层 keepalive 已经是 15s，这里再 10s 一次等于让无线反复被叫醒。
+    // 3 次收不到回显（≈1 分钟）就判定死链，直接断开让 supervisor 重连。
+    let mut hb = tokio::time::interval(std::time::Duration::from_secs(20));
     let mut hb_fails = 0u32;
     loop {
         let pair = tokio::select! {

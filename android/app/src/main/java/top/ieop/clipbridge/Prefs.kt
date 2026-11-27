@@ -31,6 +31,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean(KEY_AUTO, true)
         set(v) = sp.edit().putBoolean(KEY_AUTO, v).apply()
 
+    /** 上次「打开 app 立刻重连」的时间戳（毫秒）。用来掐住反复重连，别一进来就抖。 */
+    var lastRecover: Long
+        get() = sp.getLong(KEY_RECOVER, 0L)
+        set(v) = sp.edit().putLong(KEY_RECOVER, v).apply()
+
     val isConfigured: Boolean get() = peerId.isNotEmpty()
 
     /**
@@ -92,6 +97,7 @@ class Prefs(context: Context) {
         private const val KEY_RELAY = "relay"
         private const val KEY_AUTO = "auto_start"
         private const val KEY_PEERS = "peers"
+        private const val KEY_RECOVER = "last_recover"
     }
 }
 

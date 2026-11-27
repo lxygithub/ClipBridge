@@ -1,10 +1,13 @@
 package top.ieop.clipbridge
 
+import android.app.AlarmManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -32,6 +35,7 @@ class SyncService : Service(), BridgeListener {
         if (intent?.action == Prefs.ACTION_STOP) {
             Native.nativeStop()
             started = false
+            cancelWake()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -61,7 +65,41 @@ class SyncService : Service(), BridgeListener {
         }
 
         if (!started) startBridge(prefs)
+        // 15 分钟一次的兜底唤醒：服务被系统/厂商后台策略杀掉后，靠它把前台服务再拉回来。
+        // inexact + ELAPSED_REALTIME_WAKEUP 不亮屏，Doze 下由系统合并，尽量少耗电。
+        scheduleWake()
         return START_STICKY
+    }
+
+    private fun scheduleWake() {
+        val am = getSystemService(AlarmManager::class.java)
+        if (am == null) {
+            Log.w(TAG, "no AlarmManager, wake-up skipped")
+            return
+        }
+        val pi = PendingIntent.getBroadcast(
+            this,
+            WAKE_REQUEST,
+            Intent(this, WakeReceiver::class.java).setAction(ACTION_WAKE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        am.setInexactRepeating(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            SystemClock.elapsedRealtime() + WAKE_INTERVAL_MS,
+            WAKE_INTERVAL_MS,
+            pi
+        )
+    }
+
+    private fun cancelWake() {
+        val am = getSystemService(AlarmManager::class.java) ?: return
+        val pi = PendingIntent.getBroadcast(
+            this,
+            WAKE_REQUEST,
+            Intent(this, WakeReceiver::class.java).setAction(ACTION_WAKE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        am.cancel(pi)
     }
 
     private fun startBridge(prefs: Prefs) {
@@ -167,6 +205,11 @@ class SyncService : Service(), BridgeListener {
 
         const val ACTION_CANCEL_TRANSFER = "top.ieop.clipbridge.CANCEL_TRANSFER"
         const val ACTION_RESTART = "top.ieop.clipbridge.RESTART"
+        const val ACTION_WAKE = "top.ieop.clipbridge.WAKE"
+
+        /** 兜底唤醒周期：15 分钟是 AlarmManager 能用的最短周期，再短就是白耗电。 */
+        private const val WAKE_INTERVAL_MS = 15L * 60L * 1000L
+        private const val WAKE_REQUEST = 1001
 
         /** 换了目标电脑：断开旧连接、按新配置重来。 */
         fun restart(context: Context) {

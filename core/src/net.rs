@@ -150,10 +150,13 @@ pub fn detect_primary_ip() -> Option<std::net::IpAddr> {
 }
 
 /// 传输层的 QUIC 参数：都是「链路差的时候别自己判死」的取向。
+///
+/// keepalive 从 3s 放到 15s：15s 仍然远小于家用 NAT 的 30s 超时，路径不会被判死，
+/// 但手机侧从「每 3 秒被叫醒一次无线」变成「每 15 秒一次」，待机耗电差一个档。
 fn transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
-        .keep_alive_interval(Duration::from_secs(3))
-        .default_path_keep_alive_interval(Duration::from_secs(3))
+        .keep_alive_interval(Duration::from_secs(15))
+        .default_path_keep_alive_interval(Duration::from_secs(15))
         .max_idle_timeout(Some(
             IdleTimeout::try_from(Duration::from_secs(60)).unwrap_or_default(),
         ))

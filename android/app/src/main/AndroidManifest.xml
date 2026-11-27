@@ -103,6 +103,11 @@
             android:name=".CopyReceiver"
             android:exported="false" />
 
+        <!-- 15 分钟兜底唤醒：服务被杀后把前台服务拉回来 -->
+        <receiver
+            android:name=".WakeReceiver"
+            android:exported="false" />
+
         <activity
             android:name=".CopyTrampoline"
             android:excludeFromRecents="true"
