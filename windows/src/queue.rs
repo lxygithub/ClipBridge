@@ -100,6 +100,11 @@ impl Store {
         Ok(())
     }
 
+    /// 某条文本在磁盘上的文件路径。删条目时要把它整个挪进回收站，而不是抹掉。
+    pub fn item_path(&self, seq: u64) -> std::path::PathBuf {
+        self.root.join("items").join(format!("{seq:012}.txt"))
+    }
+
     /// 清空全部条目（保留 seq 水位线，避免 seq 回退）。
     pub fn clear(&self) -> Result<()> {
         let items = self.root.join("items");

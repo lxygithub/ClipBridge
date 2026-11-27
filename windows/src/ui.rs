@@ -31,7 +31,8 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, SetFocus, MOD_ALT, MOD_CONTROL, VK_CONTROL, VK_V,
+    GetKeyState, RegisterHotKey, SetFocus, MOD_ALT, MOD_CONTROL, VK_A, VK_CONTROL, VK_DELETE,
+    VK_ESCAPE, VK_V,
 };
 use windows_sys::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, Shell_NotifyIconW, ShellExecuteW, NIF_ICON,
@@ -77,6 +78,8 @@ const C_BORDER: u32 = 0x0032_2318; // #182332
 // 两块热区各自的底色，靠色相区分，不再用一条分隔线硬切
 const C_ZONE_TEXT_BG: u32 = 0x001C1E0E; // #0E1E1C 偏青
 const C_ROW_HOVER: u32 = 0x00281D12; // #121D28
+/// 选中的行：比悬浮再亮一档，靠「底色 + 满色边框」表示选中
+const C_ROW_SEL: u32 = 0x00342A19; // #192A34
 
 // 列表行按方向上色，口径与手机端时间线完全一致：
 //   发 = 琥珀 #F5B95B，收 = 青 #7BD3C0
@@ -152,12 +155,14 @@ pub struct LinkInfo {
 
 /// 列表里的一行：文本 / 文件 / 剪贴板图片。
 pub enum RowKind {
-    Text { text: String },
+    Text { seq: u64, text: String },
     File { path: PathBuf },
     Image { path: PathBuf },
 }
 
 pub struct Row {
+    /// 稳定身份：`t<seq>` / `f<路径>` / `i<路径>`。列表每 2 秒重排，选中状态按它记才不会串行
+    pub key: String,
     pub kind: RowKind,
     pub mtime: u64,
     /// true = 电脑发出去的，false = 手机发过来的；决定行边框配色
@@ -186,6 +191,10 @@ pub struct App {
     peer_names: Mutex<std::collections::HashMap<String, String>>,
     /// 只发给这一台；None = 广播给全部
     target: Mutex<Option<String>>,
+    /// 列表里选中的行（存 Row::key）。Ctrl+点追加/取消，Delete 一次性删掉
+    selected: Mutex<std::collections::HashSet<String>>,
+    /// 删掉的东西不直接抹掉，挪到这儿还能捞回来
+    trash: PathBuf,
     inbox: PathBuf,
     outbox: PathBuf,
     /// 剪贴板图片落地目录（`in_`/`out_` 前缀区分收发的方向）
@@ -228,6 +237,8 @@ impl App {
             peers: Mutex::new(Vec::new()),
             peer_names: Mutex::new(std::collections::HashMap::new()),
             target: Mutex::new(None),
+            selected: Mutex::new(std::collections::HashSet::new()),
+            trash: dir.join("trash"),
             inbox: dir.join("inbox"),
             outbox: dir.join("outbox"),
             images: dir.join("images"),
@@ -484,6 +495,127 @@ impl App {
         if hwnd != 0 {
             unsafe { PostMessageW(hwnd as HWND, WM_APP_REFRESH, 0, 0) };
         }
+    }
+
+    /// 这一行选没选中。
+    pub fn is_selected(&self, key: &str) -> bool {
+        self.selected.lock().unwrap().contains(key)
+    }
+
+    pub fn selection_len(&self) -> usize {
+        self.selected.lock().unwrap().len()
+    }
+
+    /// 删除时文件被挪去的地方，提示里要写给用户看。
+    pub fn trash_dir(&self) -> &Path {
+        &self.trash
+    }
+
+    /// Ctrl+点：把这行加进选中或移出去。
+    pub fn toggle_selected(&self, key: &str) {
+        {
+            let mut set = self.selected.lock().unwrap();
+            if !set.remove(key) {
+                set.insert(key.to_string());
+            }
+        }
+        self.refresh();
+    }
+
+    /// Ctrl+A：当前列表全选。
+    pub fn select_all_rows(&self) {
+        {
+            let rows = self.rows.lock().unwrap();
+            let mut set = self.selected.lock().unwrap();
+            set.clear();
+            for r in rows.iter() {
+                set.insert(r.key.clone());
+            }
+        }
+        self.refresh();
+    }
+
+    /// 点空白处 / Esc：清空选中。返回是否真的清掉了东西。
+    pub fn clear_selection(&self) -> bool {
+        let had = {
+            let mut set = self.selected.lock().unwrap();
+            let had = !set.is_empty();
+            set.clear();
+            had
+        };
+        if had {
+            self.refresh();
+        }
+        had
+    }
+
+    /// 删除选中的条目，返回删掉的条数。
+    ///
+    /// 文本从 store 里摘掉（本来就是我们自己的历史库）；文件和图片不直接删盘，
+    /// 挪到 `<数据目录>\trash` 下，误删了还能拖回来。
+    pub fn delete_selected(&self) -> usize {
+        let keys: std::collections::HashSet<String> =
+            std::mem::take(&mut *self.selected.lock().unwrap());
+        if keys.is_empty() {
+            return 0;
+        }
+        let mut n = 0usize;
+        {
+            let rows = self.rows.lock().unwrap();
+            for row in rows.iter() {
+                if !keys.contains(&row.key) {
+                    continue;
+                }
+                match &row.kind {
+                    RowKind::Text { seq, .. } => {
+                        // 文本也走回收站：直接 store.remove 就再也找不回来了
+                        let p = self.store.item_path(*seq);
+                        if self.move_to_trash(&p) {
+                            n += 1;
+                        }
+                    }
+                    RowKind::File { path } => {
+                        if self.move_to_trash(path) {
+                            n += 1;
+                        }
+                    }
+                    RowKind::Image { path } => {
+                        if self.move_to_trash(path) {
+                            n += 1;
+                            self.thumbs.lock().unwrap().remove(path);
+                        }
+                    }
+                }
+            }
+        }
+        // store 变了，内存里的文本列表跟着重建，窗口下一帧就是删干净的样子
+        if let Ok(all) = self.store.all() {
+            *self.items.lock().unwrap() = all
+                .into_iter()
+                .map(|(seq, text, mtime)| HistoryItem { seq, text, mtime })
+                .collect();
+        }
+        self.refresh();
+        n
+    }
+
+    /// 挪进 `trash/`，重名就加时间戳，避免覆盖之前删的同名文件。
+    fn move_to_trash(&self, path: &Path) -> bool {
+        let _ = std::fs::create_dir_all(&self.trash);
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut dst = self.trash.join(&name);
+        if dst.exists() {
+            let stamp = crate::queue::now_secs();
+            let (stem, ext) = match name.rsplit_once('.') {
+                Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+                _ => (name.clone(), String::new()),
+            };
+            dst = self.trash.join(format!("{stem}-{stamp}{ext}"));
+        }
+        std::fs::rename(path, &dst).is_ok()
     }
 
     /// 翻到条目页 / 日志页；两页共用一块列表区，只换数据源。
@@ -794,6 +926,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let (_, text_r, file_r) = zone_rects(rc.right);
                 let (x, y) = (((lp & 0xFFFF) as i16) as i32, (((lp >> 16) & 0xFFFF) as i16) as i32);
                 let pt = POINT { x, y };
+                // 先看「删除 N」那枚胶囊：它在标题行，和列表区不重叠，但顺序放在最前面免得起冲突
+                if let Some(cr) = delete_chip_rect(&*app) {
+                    if hit(&cr, pt) {
+                        delete_rows(&*app, hwnd);
+                        return 0;
+                    }
+                }
                 if hit(&text_r, pt) {
                     send_clipboard(&*app, hwnd);
                 } else if hit(&file_r, pt) {
@@ -804,15 +943,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let next = if (*app).page() == 0 { 1 } else { 0 };
                     (*app).set_page(next);
                 } else {
-                    activate_row(&*app, hwnd, pt);
+                    let idx = row_at(&*app, rc.right, pt);
+                    if idx < 0 {
+                        // 点空白：取消选中
+                        if (*app).clear_selection() {
+                            InvalidateRect(hwnd, ptr::null(), 0);
+                        }
+                    } else if GetKeyState(VK_CONTROL as i32) < 0 {
+                        // Ctrl+点：加进选中 / 移出选中，不触发复制或打开
+                        let key = {
+                            let rows = (*app).rows.lock().unwrap();
+                            rows.get(idx as usize).map(|r| r.key.clone())
+                        };
+                        if let Some(k) = key {
+                            (*app).toggle_selected(&k);
+                            InvalidateRect(hwnd, ptr::null(), 0);
+                        }
+                    } else {
+                        // 普通点：先清掉多选，再做原来的动作（复制 / 打开）
+                        (*app).clear_selection();
+                        activate_row(&*app, hwnd, pt);
+                    }
                 }
             }
             0
         }
         WM_KEYDOWN => {
-            if is_hist && wp == VK_V as usize && GetKeyState(VK_CONTROL as i32) < 0 {
-                // 悬浮在哪块都行，Ctrl+V 直接发剪贴板里的文本
-                send_clipboard(&*app, hwnd);
+            if is_hist && !app.is_null() {
+                let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+                if wp == VK_V as usize && ctrl {
+                    // 悬浮在哪块都行，Ctrl+V 直接发剪贴板里的文本
+                    send_clipboard(&*app, hwnd);
+                } else if wp == VK_DELETE as usize {
+                    delete_rows(&*app, hwnd);
+                } else if wp == VK_ESCAPE as usize {
+                    if (*app).clear_selection() {
+                        InvalidateRect(hwnd, ptr::null(), 0);
+                    }
+                } else if wp == VK_A as usize && ctrl {
+                    (*app).select_all_rows();
+                    InvalidateRect(hwnd, ptr::null(), 0);
+                }
             }
             0
         }
@@ -855,6 +1026,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 fn hit(rc: &RECT, pt: POINT) -> bool {
     pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
+}
+
+/// 删除选中的条目（Delete 键和「删除 N」胶囊共用）。文件不真删，挪进 trash。
+unsafe fn delete_rows(app: &App, hwnd: HWND) {
+    if app.selection_len() == 0 {
+        app.set_hint("先 Ctrl+点选要删的条目");
+        return;
+    }
+    let n = app.delete_selected();
+    let trash = app.trash_dir().display().to_string();
+    if n == 0 {
+        app.set_hint("没删成（文件可能被别的程序占用）");
+    } else if app.page() == 1 {
+        app.set_hint(&format!("已删除 {n} 条"));
+    } else {
+        app.set_hint(&format!("已删除 {n} 条（文件挪到了 {trash}）"));
+    }
+    InvalidateRect(hwnd, ptr::null(), 0);
 }
 
 /// 发送目标那一行的胶囊几何：第一枚是「全部」，后面每台手机一枚。
@@ -913,6 +1102,22 @@ fn chip_text_w(s: &str) -> i32 {
         .map(|c| if c.is_ascii() { 7 } else { 12 })
         .sum::<i32>()
         .max(14)
+}
+
+/// 「删除 N」那枚胶囊的位置：贴着「全部条目」标题右边，和列表首行齐高。
+fn delete_chip_rect(app: &App) -> Option<RECT> {
+    let n = app.selection_len();
+    if n == 0 {
+        return None;
+    }
+    let label = format!("删除 {n}");
+    let wpx = 22 + chip_text_w(&label);
+    Some(RECT {
+        left: 96,
+        top: LIST_TOP - 32,
+        right: 96 + wpx,
+        bottom: LIST_TOP - 8,
+    })
 }
 
 /// 点中的是哪一枚：`Some(None)` = 全部，`Some(Some(id))` = 指定手机，`None` = 没点这里。
@@ -1319,6 +1524,25 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         DT_SINGLELINE | DT_RIGHT,
     );
 
+    // 有选中才有这枚「删除 N」：没选中时一个多余控件都不画
+    if let Some(cr) = delete_chip_rect(app) {
+        let label = format!("删除 {}", app.selection_len());
+        fill_round(hdc, cr, C_PANEL, C_AMBER, 6);
+        text_in(
+            hdc,
+            &label,
+            RECT {
+                left: cr.left,
+                top: cr.top,
+                right: cr.right,
+                bottom: cr.bottom,
+            },
+            small_font(),
+            C_AMBER,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER,
+        );
+    }
+
     // 条目
     let scroll = app.scroll.load(Ordering::Relaxed) as i32;
     let hover = app.hover.load(Ordering::Relaxed) as i32;
@@ -1361,16 +1585,25 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
                 break;
             }
             let hot = hover == i as i32;
+            let sel = app.is_selected(&row.key);
             let is_file = matches!(row.kind, RowKind::File { .. });
             let is_image = matches!(row.kind, RowKind::Image { .. });
             // 方向配色和手机端一致：发=琥珀，收=青。静默走暗档、悬浮提亮，边框 1px。
-            let edge = match (row.outgoing, hot) {
+            // 选中行不提亮边框、只换底色 + 保持满色，免得和「悬浮」两套高亮打架。
+            let edge = match (row.outgoing, hot || sel) {
                 (true, true) => C_SEND,
                 (true, false) => C_SEND_DIM,
                 (false, true) => C_RECV,
                 (false, false) => C_RECV_DIM,
             };
-            fill_round(hdc, r, if hot { C_ROW_HOVER } else { C_PANEL }, edge, 8);
+            let face = if sel {
+                C_ROW_SEL
+            } else if hot {
+                C_ROW_HOVER
+            } else {
+                C_PANEL
+            };
+            fill_round(hdc, r, face, edge, 8);
 
             // 类型图标：文本=复制小方块，文件=文档，图片=缩略图
             let mut text_left = r.left + 40;
@@ -1710,7 +1943,9 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
             .take(120)
             .collect();
         rows.push(Row {
+            key: format!("t{}", it.seq),
             kind: RowKind::Text {
+                seq: it.seq,
                 text: it.text.clone(),
             },
             mtime: it.mtime,
@@ -1754,6 +1989,7 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 rows.push(Row {
+                    key: format!("f{}", path.display()),
                     kind: RowKind::File { path: path.clone() },
                     mtime,
                     outgoing,
@@ -1803,6 +2039,7 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                 .unwrap_or(0);
             let (w, h) = dims.unwrap_or((0, 0));
             rows.push(Row {
+                key: format!("i{}", path.display()),
                 kind: RowKind::Image { path: path.clone() },
                 mtime,
                 outgoing,
@@ -1827,6 +2064,13 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
 
     rows.sort_by_key(|r| std::cmp::Reverse(r.mtime));
     rows.truncate(200);
+    // 选中集合只保留还存在的行：条目被别人删了/自己发完移走了，选中项不能赖着不走
+    {
+        let alive: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.key.as_str()).collect();
+        let mut set = app.selected.lock().unwrap();
+        set.retain(|k| alive.contains(k.as_str()));
+    }
     let mut cur = app.rows.lock().unwrap();
     // 条目变化才重排，免得每 2 秒把滚动位置顶掉
     let same = cur.len() == rows.len()
