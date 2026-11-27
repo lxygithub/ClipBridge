@@ -29,11 +29,12 @@
         </activity>
 
         <!-- 统一的无 UI 发送入口：快捷方式 / 分享面板 / 磁贴 -->
+        <!-- 注意：不能加 noHistory。选文件要先跳系统选择器，设了 noHistory 这个 Activity
+             一进后台就被销毁，选择结果回不来，表现就是「点了发送文件没反应」。 -->
         <activity
             android:name=".QuickSendActivity"
             android:excludeFromRecents="true"
             android:exported="true"
-            android:noHistory="true"
             android:taskAffinity=""
             android:theme="@style/Theme.ClipBridge.Transparent">
 
