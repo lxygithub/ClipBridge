@@ -53,6 +53,8 @@ class QuickSendActivity : ComponentActivity() {
         }
         // 服务没在跑就顺手拉起来，发送时它会自己建连
         SyncService.start(this)
+        // 时间线要落盘就得先 attach（否则发完这条只活在内存里，一进主界面就被磁盘旧数据替换）
+        BridgeState.attach(this)
 
         when (intent?.action) {
             ACTION_SEND_CLIP -> wantClipboard = true
@@ -211,6 +213,9 @@ class QuickSendActivity : ComponentActivity() {
                     Thread.sleep(300)
                 }
             }
+            // 分享面板这条路以前不写时间线：通道明明发成功了，用户回头在列表里找不到，
+            // 看起来就像「没发出去」。发成功就补一条 outgoing 记录。
+            if (ok) BridgeState.markSent(text)
             runOnUiThread {
                 toast(if (ok) "已发送到电脑" else "发送失败：电脑未连接")
                 finish()

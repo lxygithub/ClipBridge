@@ -141,6 +141,8 @@ pub struct HistoryItem {
     pub seq: u64,
     pub text: String,
     pub mtime: u64,
+    /// 收进来的条目记着发件设备名；电脑自己发出去的是 None
+    pub from: Option<String>,
 }
 
 /// 一条连接当前的链路状态，给标题栏那枚徽标用。
@@ -241,7 +243,12 @@ impl App {
             .all()
             .unwrap_or_default()
             .into_iter()
-            .map(|(seq, text, mtime)| HistoryItem { seq, text, mtime })
+            .map(|(seq, text, mtime)| HistoryItem {
+                seq,
+                text,
+                mtime,
+                from: store.incoming_from(seq),
+            })
             .collect();
         Self {
             store,
@@ -530,8 +537,26 @@ impl App {
         }
     }
 
+    /// EndpointId → 给人看的设备名（名字还没到时退回短 id）。
+    pub fn peer_display(&self, id: &str) -> String {
+        let names = self.peer_names.lock().unwrap();
+        match names.get(id) {
+            Some(n) if !n.trim().is_empty() => n.clone(),
+            _ => format!("手机 · {}…", &id[..8.min(id.len())]),
+        }
+    }
+
     /// 新条目：进内存 + 刷新窗口（网络线程调用）。
     pub fn add(&self, seq: u64, text: &str) {
+        self.add_item(seq, text, None);
+    }
+
+    /// 手机发过来的条目：记下发件设备，列表里显示「来自 xxx」。
+    pub fn add_in(&self, seq: u64, text: &str, from: &str) {
+        self.add_item(seq, text, Some(from.to_string()));
+    }
+
+    fn add_item(&self, seq: u64, text: &str, from: Option<String>) {
         let mtime = crate::queue::now_secs();
         self.items.lock().unwrap().insert(
             0,
@@ -539,6 +564,7 @@ impl App {
                 seq,
                 text: text.to_string(),
                 mtime,
+                from,
             },
         );
         self.refresh();
@@ -675,7 +701,12 @@ impl App {
         if let Ok(all) = self.store.all() {
             *self.items.lock().unwrap() = all
                 .into_iter()
-                .map(|(seq, text, mtime)| HistoryItem { seq, text, mtime })
+                .map(|(seq, text, mtime)| HistoryItem {
+                    seq,
+                    text,
+                    mtime,
+                    from: self.store.incoming_from(seq),
+                })
                 .collect();
         }
         self.refresh();
@@ -1989,10 +2020,14 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
             .take(120)
             .collect();
         let key = format!("t{}", it.seq);
-        // 历史条目写「当初发给了谁」，不再跟着当前选择漂移；老数据没记录就只说已发送
-        let sent = match app.delivered_of(&key) {
-            Some(w) => format!("发给 {w}"),
-            None => "已发送".to_string(),
+        // 收进来的用「来自 谁」，发出去的写「当初发给了谁」；两个都不跟当前选择漂移
+        let outgoing = it.from.is_none();
+        let meta_head = match &it.from {
+            Some(from) => format!("来自 {from}"),
+            None => match app.delivered_of(&key) {
+                Some(w) => format!("发给 {w}"),
+                None => "已发送".to_string(),
+            },
         };
         rows.push(Row {
             key,
@@ -2001,10 +2036,9 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                 text: it.text.clone(),
             },
             mtime: it.mtime,
-            // store 里的文本都是电脑发出去的（手机发来的只写剪贴板、不入队）
-            outgoing: true,
+            outgoing,
             title: head.trim().replace('\t', " "),
-            meta: format!("{sent} · {}", fmt_time(it.mtime)),
+            meta: format!("{meta_head} · {}", fmt_time(it.mtime)),
         });
     }
 

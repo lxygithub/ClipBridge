@@ -47,6 +47,36 @@ impl Store {
         Ok(seq)
     }
 
+    /// 记下「手机发过来的一条」：文本照旧落 items，另写一个 `.in` 标记（内容是发件设备名）。
+    /// 这样历史列表能显示「来自 xxx」，补发给手机时也不会把人家自己发的再甩回去。
+    pub fn push_incoming(&self, text: &str, from: &str) -> Result<u64> {
+        let seq = self.last_seq() + 1;
+        let items = self.root.join("items");
+        fs::write(items.join(format!("{seq:012}.txt")), text).context("write item")?;
+        fs::write(items.join(format!("{seq:012}.in")), from).context("write in marker")?;
+        fs::write(self.seq_path(), seq.to_string()).context("write seq")?;
+        Ok(seq)
+    }
+
+    /// 这条是不是收进来的（返回发件设备名）；None = 电脑自己发出去的。
+    pub fn incoming_from(&self, seq: u64) -> Option<String> {
+        let path = self.root.join("items").join(format!("{seq:012}.in"));
+        let from = fs::read_to_string(path).ok()?;
+        let from = from.trim().to_string();
+        if from.is_empty() {
+            Some("手机".to_string())
+        } else {
+            Some(from)
+        }
+    }
+
+    /// 取 seq > after 的全部**发出去**的条目（补发不该把收到的内容推回手机）。
+    pub fn since_outgoing(&self, after: u64) -> Result<Vec<(u64, String)>> {
+        let mut items = self.since(after)?;
+        items.retain(|(seq, _)| self.incoming_from(*seq).is_none());
+        Ok(items)
+    }
+
     /// 取 seq > after 的全部条目，按 seq 升序。
     pub fn since(&self, after: u64) -> Result<Vec<(u64, String)>> {
         let mut out = Vec::new();
@@ -69,8 +99,7 @@ impl Store {
     }
 
     /// 全量条目（含 mtime），供历史窗口展示，按 seq 降序（新的在前）。
-    pub fn all(&self) -> Result<Vec<(u64, String, u64)>> {
-        let mut out = Vec::new();
+    pub fn all(&self) -> Result<Vec<(u64, String, u64)>> {        let mut out = Vec::new();
         for entry in fs::read_dir(self.root.join("items")).context("read items dir")? {
             let path = entry?.path();
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -90,6 +119,13 @@ impl Store {
         }
         out.sort_by(|a, b| b.0.cmp(&a.0));
         Ok(out)
+    }
+
+    /// 全量里去掉「手机发来的」，只留电脑发出去的（握手时甩给手机的历史快照用）。
+    pub fn all_outgoing(&self) -> Result<Vec<(u64, String, u64)>> {
+        let mut items = self.all()?;
+        items.retain(|(seq, _, _)| self.incoming_from(*seq).is_none());
+        Ok(items)
     }
 
     /// 删除单条（历史管理页用）。

@@ -41,6 +41,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -314,6 +315,16 @@ private fun ChannelScreen(
         }
         Spacer(Modifier.height(4.dp))
 
+        // LazyColumn 带 key 时会按 key 保持滚动锚点：新条目插到头部后列表仍停在上一条，
+        // 表现就是「发出去了但列表里看不见」。停靠在顶部时手动归位到 0。
+        val listState = rememberLazyListState()
+        val headKey = items.firstOrNull()?.let { "${it.seq}-${it.ts}" }
+        LaunchedEffect(headKey) {
+            if (headKey != null && listState.firstVisibleItemIndex <= 1) {
+                listState.scrollToItem(0, 0)
+            }
+        }
+
         Box(Modifier.weight(1f).fillMaxWidth()) {
             if (items.isEmpty()) {
                 Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
@@ -325,7 +336,7 @@ private fun ChannelScreen(
                     )
                 }
             } else {
-                LazyColumn(Modifier.fillMaxSize()) {
+                LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                     items(items, key = { "${it.seq}-${it.ts}" }) { item ->
                         TimelineRow(item, pcName) { selected = item }
                     }

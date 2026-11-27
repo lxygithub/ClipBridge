@@ -795,7 +795,7 @@ async fn handle_conn(
                         // 手机名按 EndpointId 记：两台手机各显示各的名字，不会互相覆盖
                         app.learn_peer_name(&peer_id, &name);
                     }
-                    match store.since(last_seq) {
+                    match store.since_outgoing(last_seq) {
                         Ok(items) => {
                             println!("[replay] {} item(s)", items.len());
                             for (seq, text) in items {
@@ -821,10 +821,25 @@ async fn handle_conn(
                     }
                 }
                 protocol::MSG_CLIP_TEXT => {
-                    // "seq|text"，seq=0 表示手机随手上传
+                    // "seq|text"，手机发来的 seq 只是它自己的编号，落库走本机的 seq 水位线
                     let body = String::from_utf8_lossy(&payload).to_string();
                     let (seq, text) = body.split_once('|').unwrap_or(("0", &body));
-                    println!("[in] #{seq} {}", text.replace('\n', " "));
+                    let from = app.peer_display(&peer_id);
+                    println!("[in] #{seq} from {from}: {}", text.replace('\n', " "));
+                    // 以前这里只打印 + 回 ACK，电脑端既不落历史也不进剪贴板，
+                    // 看起来就是「手机说已发送，电脑上什么都没有」。
+                    match store.push_incoming(text, &from) {
+                        Ok(new_seq) => {
+                            app.add_in(new_seq, text, &from);
+                            let ok = ui::write_clipboard(text);
+                            app.set_hint(&format!(
+                                "收到 {from} 的 {} 字{}",
+                                text.chars().count(),
+                                if ok { "，已放进剪贴板" } else { "，剪贴板被占用" }
+                            ));
+                        }
+                        Err(err) => eprintln!("[in] store failed: {err:#}"),
+                    }
                     let _ = protocol::write_frame(&mut send, protocol::MSG_ACK, b"").await;
                     let _ = send.finish();
                 }
@@ -981,7 +996,7 @@ async fn target_conns(peers: &Peers, app: &std::sync::Arc<ui::App>) -> Vec<Conne
 /// 历史快照：最近 200 条文本，`{"items":[[seq,text,mtime],...]}`。
 /// 手机端只用于填时间线，不写剪贴板、不弹通知；文本累计超过 6MB 就截断（帧上限 16MB）。
 async fn push_history(conn: Connection, store: Arc<Store>) -> Result<()> {
-    let all = store.all()?;
+    let all = store.all_outgoing()?;
     let start = all.len().saturating_sub(200);
     let mut arr: Vec<serde_json::Value> = Vec::new();
     let mut bytes = 0usize;
