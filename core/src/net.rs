@@ -158,7 +158,9 @@ fn transport_config() -> QuicTransportConfig {
         .keep_alive_interval(Duration::from_secs(15))
         .default_path_keep_alive_interval(Duration::from_secs(15))
         .max_idle_timeout(Some(
-            IdleTimeout::try_from(Duration::from_secs(60)).unwrap_or_default(),
+            // 45s = 三次 keepalive 都没回 ACK。手机端自己 15s 一轮探活，通常它先发现；
+            // 这条主要是兜住「手机被冻住、连探活都没发出去」的情况，别让电脑端一直挂着幽灵设备。
+            IdleTimeout::try_from(Duration::from_secs(45)).unwrap_or_default(),
         ))
         .build()
 }

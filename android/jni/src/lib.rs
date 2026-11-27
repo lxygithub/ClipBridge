@@ -43,6 +43,19 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 手机上没有 stdout，logcat 里看不到 Rust 的 eprintln。
+/// 建连/断链这种「事后要追溯」的事件统一写进 files/link.log。
+fn log_line(dir: &std::path::Path, msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("link.log"))
+    {
+        let _ = writeln!(f, "{} {msg}", now_ms());
+    }
+}
+
 /// 当前链路，形如 `direct|12` 或 `relay|312`（毫秒），空串表示没连上。
 /// UI 每 2 秒通过 `nativePathStatus` 读一次。
 static LINK: Mutex<String> = Mutex::new(String::new());
@@ -225,7 +238,12 @@ impl Session {
 
     async fn connect_once(&self) -> Result<Connection> {
         let addr = net::parse_peer(&self.peer, &self.relay)?;
-        self.ep.connect(addr, ALPN).await.context("connect to windows")
+        // 连接一定要有上限：没有超时的 connect 会在弱中继/待机断网时一挂几分钟，
+        // supervisor 就卡在这里不动，看起来就是「手机一直在连、电脑端一直收不到」。
+        tokio::time::timeout(Duration::from_secs(12), self.ep.connect(addr, ALPN))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect timeout (12s)"))?
+            .context("connect to windows")
     }
 
     /// 连上后先发 HELLO（带已确认 seq + 本机名），让 Windows 补发错过的条目、
@@ -381,13 +399,15 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
     loop {
         // 会话被换掉之后这条连接已经作废，老的心跳不能再发探活、更不能写 UI
         if !sess.current() || conn.close_reason().is_some() {
+            log_line(&sess.dir, &format!("pump: exit {:?}", conn.close_reason()));
             break;
         }
         let fg = FOREGROUND.load(Ordering::Relaxed);
-        let wait = if fg { Duration::from_secs(5) } else { Duration::from_secs(20) };
+        let wait = if fg { Duration::from_secs(5) } else { Duration::from_secs(15) };
         // 前台这一轮里失败会立刻补一次短探活（见下），所以「这一次失败」就等于
         // 「两次都没通」——不必再等下一个 5s 周期，用户盯着屏幕时那一轮太贵了。
-        let need = if fg { 1 } else { 3 };
+        // 后台容错一次：弱中继偶发丢一个包不该把连接拆掉，两次连续不通才断（≈30s 内总会有结论）。
+        let need = if fg { 1 } else { 2 };
         let pair = tokio::select! {
             // 到点了
             _ = tokio::time::sleep(wait) => None,
@@ -428,10 +448,14 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                 LAST_ALIVE.store(now_ms(), Ordering::SeqCst);
             } else {
                 hb_fails += 1;
-                eprintln!("[jni] ping failed ({hb_fails}/{need})");
+                // 一旦开始怀疑链路，就别再等 15s 的下一个周期：3 秒后再确认一次，
+                // 真死能快 10 秒发现，只是丢一个包也还来得及在第 2 次自证清白。
+                if !fg && hb_fails < need {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
             }
             if hb_fails >= need {
-                eprintln!("[jni] link dead ({hb_fails} missed pings), reconnecting");
+                log_line(&sess.dir, &format!("pump: link dead ({hb_fails} missed pings)"));
                 sess.state("disconnected");
                 conn.close(0u32.into(), b"link dead");
                 break;
@@ -440,7 +464,10 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
         };
         let (mut send, mut recv) = match pair {
             Ok(pair) => pair,
-            Err(_) => break,
+            Err(err) => {
+                log_line(&sess.dir, &format!("pump: accept_bi err {err:?}"));
+                break;
+            }
         };
         // 收到电脑主动开的流本身就说明链路活着，记一笔（进前台时据此判断要不要重建）
         LAST_ALIVE.store(now_ms(), Ordering::SeqCst);
@@ -672,17 +699,21 @@ async fn supervise(sess: Arc<Session>) {
             break;
         }
         sess.state("connecting");
+        log_line(&sess.dir, "connect: try");
         let recovered = match sess.connect_once().await {
             Ok(conn) => {
+                log_line(&sess.dir, "connect: ok");
                 if let Err(err) = sess.hello(&conn).await {
                     eprintln!("[jni] hello failed: {err:#}");
+                    log_line(&sess.dir, &format!("hello failed: {err:#}"));
                 }
                 backoff = Duration::from_secs(1);
                 pump_conn(Arc::clone(&sess), conn).await;
+                log_line(&sess.dir, "pump: ended");
                 true
             }
             Err(err) => {
-                eprintln!("[jni] connect failed: {err:#}");
+                log_line(&sess.dir, &format!("connect: failed {err:#}"));
                 sess.state("disconnected");
                 false
             }
