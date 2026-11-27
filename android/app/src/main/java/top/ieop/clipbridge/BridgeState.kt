@@ -11,6 +11,14 @@ data class ClipItem(
 )
 
 /** 跨界面共享的连接状态（Rust 回调线程写，UI 读）。 */
+/** 手机收到的一个文件（来自 Rust 侧 inbox 扫描）。 */
+data class RecvFile(
+    val name: String,
+    val size: Long,
+    val path: String,
+    val mtime: Long
+)
+
 object BridgeState {
     val state = MutableStateFlow("idle")
     val lastSeq = MutableStateFlow(0L)
@@ -18,6 +26,12 @@ object BridgeState {
     /** 界面时间线，新的在最上面 */
     val items = MutableStateFlow<List<ClipItem>>(emptyList())
     val sentCount = MutableStateFlow(0)
+
+    /** 链路：`direct|12` / `relay|312` / 空串，Rust 侧每 2 秒刷新一次 */
+    val link = MutableStateFlow("")
+
+    /** 收到的文件列表 */
+    val files = MutableStateFlow<List<RecvFile>>(emptyList())
 
     fun set(newState: String) {
         state.value = newState

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 收到的文件落在 files/inbox/，分享时从这里临时授权给别的 app -->
+    <files-path name="files" path="." />
+    <cache-path name="cache" path="." />
+</paths>

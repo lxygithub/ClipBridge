@@ -82,6 +82,17 @@
             </intent-filter>
         </service>
 
+        <!-- 私有目录里的文件要分享出去，必须走 FileProvider 授权 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <!-- 通知按钮：直接写剪贴板 -->
         <receiver
             android:name=".CopyReceiver"

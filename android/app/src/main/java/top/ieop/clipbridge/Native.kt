@@ -28,6 +28,12 @@ object Native {
     external fun nativeSelfInfo(): String
 
     external fun nativeAckedSeq(): Long
+
+    /** 当前链路：`direct|12`（直连 12ms）/ `relay|312` / 空串（没连上） */
+    external fun nativePathStatus(): String
+
+    /** 手机收到的文件，JSON 数组：[{name,size,mtime,path}] */
+    external fun nativeListFiles(): String
 }
 
 /** Rust 侧通过 JNI 回调这些方法，方法名与签名必须保持一致。 */

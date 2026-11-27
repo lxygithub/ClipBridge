@@ -22,6 +22,10 @@ use tokio::runtime::Runtime;
 static RT: OnceLock<Runtime> = OnceLock::new();
 static SESSION: OnceLock<Mutex<Option<Arc<Session>>>> = OnceLock::new();
 
+/// 当前链路，形如 `direct|12` 或 `relay|312`（毫秒），空串表示没连上。
+/// UI 每 2 秒通过 `nativePathStatus` 读一次。
+static LINK: Mutex<String> = Mutex::new(String::new());
+
 fn rt() -> &'static Runtime {
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -157,6 +161,41 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
         *guard = Some(conn.clone());
     }
     sess.state("connected");
+
+    // 链路状态：每 2 秒看一眼选中的路径（打洞成功 iroh 会新增 IP 路径并切过去），
+    // 写进 LINK 供 UI 显示「直连 / 中继 + 延迟」。连接断开就清空。
+    tokio::spawn({
+        let conn = conn.clone();
+        async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                if conn.close_reason().is_some() {
+                    *LINK.lock().unwrap() = String::new();
+                    break;
+                }
+                let mut selected = None;
+                let mut any = None;
+                for p in conn.paths().iter() {
+                    let pair = (p.is_ip(), p.rtt().as_millis() as u64);
+                    if p.is_selected() {
+                        selected = Some(pair);
+                    }
+                    if any.is_none() {
+                        any = Some(pair);
+                    }
+                }
+                let text = match selected.or(any) {
+                    Some((direct, rtt)) => {
+                        let kind = if direct { "direct" } else { "relay" };
+                        format!("{kind}|{rtt}")
+                    }
+                    None => String::new(),
+                };
+                *LINK.lock().unwrap() = text;
+            }
+        }
+    });
 
     // 心跳：每 20s 探一次活。QUIC 层现在自己带 3s keepalive + 60s idle，
     // 这里只负责把「状态」及时反映到 UI，**不再主动关连接**：半开检测反而杀好连接。
@@ -663,6 +702,10 @@ async fn diag_loop(sess: Arc<Session>) {
             text.push_str(&format!("self_addrs={:?}\n", sess.ep.addr()));
         }
     }
+    // 诊断日志轮转：超过 1MB 就挪成 diag.log.1，只留一份
+    if std::fs::metadata(&path).map(|m| m.len() > 1024 * 1024).unwrap_or(false) {
+        let _ = std::fs::rename(&path, sess.dir.join("diag.log.1"));
+    }
     let _ = std::fs::write(&path, &text);
 }
 
@@ -771,6 +814,59 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeAckedSeq(
         .as_ref()
         .map(|s| s.acked.load(Ordering::Relaxed) as jlong)
         .unwrap_or(0)
+}
+
+/// `Native.pathStatus()` → `"direct|12"` / `"relay|312"`，空串表示未连接。
+#[no_mangle]
+pub extern "system" fn Java_top_ieop_clipbridge_Native_nativePathStatus(
+    mut env: JNIEnv,
+    _class: JObject,
+) -> jstring {
+    let text = LINK.lock().unwrap().clone();
+    match env.new_string(text) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// `Native.listFiles()` → JSON 数组：手机收到的文件（主界面文件区、长按分享用）。
+#[no_mangle]
+pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeListFiles(
+    mut env: JNIEnv,
+    _class: JObject,
+) -> jstring {
+    let dir = slot().lock().unwrap().as_ref().map(|s| s.dir.clone());
+    let mut rows = Vec::new();
+    if let Some(dir) = dir {
+        if let Ok(entries) = std::fs::read_dir(dir.join("inbox")) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Ok(meta) = e.metadata() else { continue };
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                rows.push(serde_json::json!({
+                    "name": p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    "size": meta.len(),
+                    "mtime": mtime,
+                    "path": p.to_string_lossy(),
+                }));
+            }
+        }
+    }
+    rows.sort_by_key(|v| std::cmp::Reverse(v["mtime"].as_u64().unwrap_or(0)));
+    rows.truncate(200);
+    let json = serde_json::Value::Array(rows).to_string();
+    match env.new_string(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 

@@ -4,13 +4,15 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import java.io.File
 
 /**
  * 所有「不打开 app」的发送入口都落到这里：
  *  - 桌面长按快捷方式（SEND_CLIP）
- *  - 分享面板（ACTION_SEND / ACTION_SEND_MULTIPLE）
+ *  - 分享面板（ACTION_SEND / ACTION_SEND_MULTIPLE：文本、图片、任意文件）
  *  - 快捷设置磁贴（内部转成 SEND_CLIP）
  *
  * 之所以必须是 Activity：Android 10+ 只有获得焦点的应用才能读剪贴板。
@@ -51,14 +53,10 @@ class QuickSendActivity : ComponentActivity() {
 
     private fun sendItem(intent: Intent) {
         val text = intent.getStringExtra(Intent.EXTRA_TEXT)
-        val uri: Uri? = intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        val uris = incomingUris(intent)
         when {
+            uris.isNotEmpty() -> runSendFile(uris)
             !text.isNullOrBlank() -> runSend(text)
-            uri != null -> {
-                // 文件传输（FILE_OFFER 流）下一步接，这里先明确提示，不假装成功
-                toast("文件传输还没接，先发文本吧")
-                finish()
-            }
             else -> {
                 toast("没有可发送的内容")
                 finish()
@@ -67,9 +65,41 @@ class QuickSendActivity : ComponentActivity() {
     }
 
     private fun sendItems(intent: Intent) {
-        val uris: List<Uri> = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM) ?: emptyList()
-        toast("暂不支持多文件（${uris.size} 个）")
-        finish()
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        val uris = incomingUris(intent)
+        when {
+            uris.isNotEmpty() -> runSendFile(uris)
+            !text.isNullOrBlank() -> runSend(text)
+            else -> {
+                toast("没有可发送的内容")
+                finish()
+            }
+        }
+    }
+
+    /**
+     * 取分享进来的文件 Uri。各家 app 传法不统一：`EXTRA_STREAM` 可能是 Uri、字符串，
+     * 也可能塞在 `ClipData` 里，三种都兜住，否则「分享过来没反应」。
+     */
+    private fun incomingUris(intent: Intent): List<Uri> {
+        val out = mutableListOf<Uri>()
+        when (val raw = intent.extras?.get(Intent.EXTRA_STREAM)) {
+            is Uri -> out += raw
+            is String -> Uri.parse(raw)?.let { out += it }
+            is ArrayList<*> -> raw.forEach {
+                when (it) {
+                    is Uri -> out += it
+                    is String -> Uri.parse(it)?.let { u -> out += u }
+                }
+            }
+        }
+        if (out.isEmpty()) {
+            val clip = intent.clipData
+            for (i in 0 until (clip?.itemCount ?: 0)) {
+                clip?.getItemAt(i)?.uri?.let { out += it }
+            }
+        }
+        return out.distinct()
     }
 
     /**
@@ -92,6 +122,64 @@ class QuickSendActivity : ComponentActivity() {
                 finish()
             }
         }, "quick-send").start()
+    }
+
+    /**
+     * 别的 app 分享过来的文件：先落到自己的缓存目录（Rust 侧只认本地路径），
+     * 发完就删。多个文件按顺序发，全部处理完才提示。
+     */
+    private fun runSendFile(uris: List<Uri>) {
+        Thread({
+            var sent = 0
+            for (uri in uris) {
+                val name = displayName(uri)
+                val tmp = File(cacheDir, name)
+                val copied = runCatching {
+                    contentResolver.openInputStream(uri)!!.use { input ->
+                        tmp.outputStream().use { input.copyTo(it) }
+                    }
+                    true
+                }.getOrDefault(false)
+                if (!copied) continue
+
+                var ok = false
+                var tries = 0
+                while (!ok && tries < 12) {
+                    ok = runCatching { Native.nativeSendFile(tmp.absolutePath) }.getOrDefault(false)
+                    if (!ok) {
+                        tries++
+                        Thread.sleep(300)
+                    }
+                }
+                tmp.delete()
+                if (ok) sent++
+            }
+            runOnUiThread {
+                toast(
+                    when {
+                        sent == 0 -> "发送失败：电脑未连接"
+                        sent == uris.size -> "已发送 $sent 个文件到电脑"
+                        else -> "已发送 $sent/${uris.size} 个文件"
+                    }
+                )
+                finish()
+            }
+        }, "quick-send-file").start()
+    }
+
+    /** 从 content Uri 里取一个能当文件名的显示名。 */
+    private fun displayName(uri: Uri): String {
+        val fallback = "shared-${System.currentTimeMillis()}"
+        return runCatching {
+            contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) c.getString(idx)?.takeIf { it.isNotBlank() } ?: fallback else fallback
+                } else {
+                    fallback
+                }
+            } ?: uri.lastPathSegment ?: fallback
+        }.getOrDefault(fallback)
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()

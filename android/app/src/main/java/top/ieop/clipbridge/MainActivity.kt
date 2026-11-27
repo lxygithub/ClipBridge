@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -14,9 +15,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,6 +32,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -39,6 +43,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,6 +58,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -138,6 +147,20 @@ private fun ChannelScreen(
     val state by BridgeState.state.collectAsState()
     val items by BridgeState.items.collectAsState()
     val sent by BridgeState.sentCount.collectAsState()
+    val link by BridgeState.link.collectAsState()
+    val files by BridgeState.files.collectAsState()
+
+    // 链路状态和文件列表都来自 Rust 侧，2 秒拉一次（读 mutex/扫目录，开销可忽略）
+    LaunchedEffect(Unit) {
+        while (true) {
+            withContext(Dispatchers.IO) {
+                BridgeState.link.value = runCatching { Native.nativePathStatus() }.getOrDefault("")
+                val raw = runCatching { Native.nativeListFiles() }.getOrDefault("[]")
+                BridgeState.files.value = parseFiles(raw)
+            }
+            delay(2000)
+        }
+    }
 
     var statsOpen by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
@@ -174,24 +197,39 @@ private fun ChannelScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Palette.void)
+            // 状态栏底下留出安全距离：原先标题贴着状态栏，字也太小
+            .statusBarsPadding()
             .padding(horizontal = 18.dp)
     ) {
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(10.dp))
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "CLIPBRIDGE / 通道",
-                color = Palette.faint,
-                fontSize = 9.sp,
+                color = Palette.dim,
+                fontSize = 12.sp,
                 letterSpacing = 2.sp
             )
             Spacer(Modifier.weight(1f))
-            TextButton(onClick = { settingsOpen = true }) {
-                Text("设置", color = Palette.dim, fontSize = 12.sp)
+            // 设置按钮做成 48dp 热区：原来是 12sp 文本 + TextButton 的窄内边距，很难点中
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clickable { settingsOpen = true },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("设置", color = Palette.dim, fontSize = 13.sp)
             }
         }
+        Spacer(Modifier.height(6.dp))
 
-        NodeCard(connected = connected, peerId = peerId, state = state, accent = accent) {
+        NodeCard(
+            connected = connected,
+            peerId = peerId,
+            state = state,
+            accent = accent,
+            link = link
+        ) {
             statsOpen = !statsOpen
         }
 
@@ -202,6 +240,15 @@ private fun ChannelScreen(
                 down = items.count { !it.outgoing },
                 up = sent,
                 state = state
+            )
+        }
+
+        if (files.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            FilesSection(
+                files = files,
+                onShare = { shareFile(ctx, File(it.path)) },
+                onOpen = { openFile(ctx, File(it.path)) }
             )
         }
 
@@ -339,6 +386,7 @@ private fun NodeCard(
     peerId: String,
     state: String,
     accent: Color,
+    link: String,
     onClick: () -> Unit
 ) {
     Row(
@@ -367,11 +415,49 @@ private fun NodeCard(
                 modifier = Modifier.padding(top = 2.dp)
             )
         }
-        Text(
-            if (connected) "点开看统计" else "重试中",
-            color = Palette.faint,
-            fontSize = 9.sp
-        )
+        PathChip(link)
+    }
+}
+
+/// 链路徽标：直连/中继 + RTT；颜色按 60ms / 160ms 分档（与桌面端同一套语义）。
+private data class LinkChip(val text: String, val fg: Color, val bg: Color)
+
+private fun linkChip(link: String, connected: Boolean): LinkChip {
+    if (!connected) {
+        return LinkChip("未连接", Color(0xFFA49587), Color(0xFF2A2220))
+    }
+    if (link.isBlank()) {
+        return LinkChip("连接中", Palette.dim, Color(0xFF16212B))
+    }
+    val parts = link.split('|')
+    val direct = parts.getOrNull(0) == "direct"
+    val ms = parts.getOrNull(1)?.toLongOrNull()
+    val head = if (direct) "直连" else "中继"
+    val tail = ms?.let { " · " + (if (it >= 1000) "%.1f s".format(it / 1000.0) else "$it ms") } ?: ""
+    val fg = when {
+        ms == null -> Palette.dim
+        ms <= 60 -> Color(0xFF7BE3A6)
+        ms <= 160 -> Color(0xFFF5B95B)
+        else -> Color(0xFFFF9A9A)
+    }
+    val bg = when {
+        ms == null -> Color(0xFF16212B)
+        ms <= 60 -> Color(0xFF14432B)
+        ms <= 160 -> Color(0xFF4A3212)
+        else -> Color(0xFF4A1D1D)
+    }
+    return LinkChip(head + tail, fg, bg)
+}
+
+@Composable
+private fun PathChip(link: String) {
+    val chip = linkChip(link, connected = BridgeState.state.value == "connected")
+    Box(
+        Modifier
+            .background(chip.bg, RoundedCornerShape(20.dp))
+            .padding(horizontal = 10.dp, vertical = 5.dp)
+    ) {
+        Text(chip.text, color = chip.fg, fontSize = 11.sp, fontWeight = FontWeight.Medium)
     }
 }
 
@@ -571,6 +657,117 @@ private fun DetailAction(label: String, onClick: () -> Unit) {
     ) {
         Text(label, color = Palette.dim, fontSize = 11.sp)
     }
+}
+
+/// 收到的文件：点一下用系统播放器打开，长按分享给别的 app。
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FilesSection(
+    files: List<RecvFile>,
+    onShare: (RecvFile) -> Unit,
+    onOpen: (RecvFile) -> Unit
+) {
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "文件 · ${files.size}",
+                color = Palette.faint,
+                fontSize = 9.sp,
+                letterSpacing = 1.4.sp
+            )
+            Spacer(Modifier.weight(1f))
+            Text("长按分享", color = Palette.faint, fontSize = 9.sp)
+        }
+        Spacer(Modifier.height(4.dp))
+        files.take(4).forEach { f ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 3.dp)
+                    .background(Palette.panel, RoundedCornerShape(3.dp))
+                    .border(1.dp, Palette.border, RoundedCornerShape(3.dp))
+                    .combinedClickable(
+                        onClick = { onOpen(f) },
+                        onLongClick = { onShare(f) }
+                    )
+                    .padding(horizontal = 11.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    f.name,
+                    color = Palette.ink,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(humanSize(f.size), color = Palette.faint, fontSize = 10.sp)
+            }
+        }
+    }
+}
+
+private fun parseFiles(raw: String): List<RecvFile> = runCatching {
+    val arr = org.json.JSONArray(raw)
+    (0 until arr.length()).map { i ->
+        val o = arr.getJSONObject(i)
+        RecvFile(
+            name = o.optString("name"),
+            size = o.optLong("size"),
+            path = o.optString("path"),
+            mtime = o.optLong("mtime")
+        )
+    }
+}.getOrDefault(emptyList())
+
+private fun humanSize(n: Long): String = when {
+    n < 1024 -> "$n B"
+    n < 1024 * 1024 -> "%.1f KB".format(n / 1024.0)
+    n < 1024L * 1024 * 1024 -> "%.1f MB".format(n / 1024.0 / 1024.0)
+    else -> "%.2f GB".format(n / 1024.0 / 1024.0 / 1024.0)
+}
+
+private fun fileMime(file: File): String {
+    val ext = file.extension.lowercase()
+    return when (ext) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "png" -> "image/png"
+        "gif" -> "image/gif"
+        "mp4" -> "video/mp4"
+        "mp3" -> "audio/mpeg"
+        "pdf" -> "application/pdf"
+        "txt", "md", "log" -> "text/plain"
+        "apk" -> "application/vnd.android.package-archive"
+        "zip" -> "application/zip"
+        else -> "application/octet-stream"
+    }
+}
+
+/** 长按分享：把 app 私有目录里的文件通过 FileProvider 授权给别的 app。 */
+private fun shareFile(ctx: Context, file: File) {
+    runCatching {
+        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", file)
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = fileMime(file)
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val chooser = Intent.createChooser(send, "分享 ${file.name}")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(chooser)
+    }.onFailure { toast(ctx, "分享失败：${it.message}") }
+}
+
+private fun openFile(ctx: Context, file: File) {
+    runCatching {
+        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", file)
+        val view = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, fileMime(file))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        ctx.startActivity(view)
+    }.onFailure { toast(ctx, "没有能打开它的 app") }
 }
 
 private fun readClipboard(ctx: Context): String? {
