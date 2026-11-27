@@ -167,11 +167,37 @@ fn transport_config() -> QuicTransportConfig {
 
 /// 解析命令行给的 `peer_id` + `relay_url`。relay 可为空（只依赖直连地址）。
 pub fn parse_peer(peer_id: &str, relay_url: &str) -> Result<EndpointAddr> {
+    parse_peer_extra(peer_id, relay_url, &[])
+}
+
+/// 同 [parse_peer]，但可以额外塞一批「上次连成功时记下来的地址」。
+///
+/// 为什么需要：默认的发现链是 DNS(TXT) + pkarr(HTTPS)。这两条都是走公网的，
+/// 断网、DoH 被墙、或者刚重启完 DNS 还没热的时候会整个失败，日志里就是
+/// `All address lookup services failed`——明明在同一台路由器下面，却要走公网才知道对方在哪。
+/// 记住上次用过的 relay URL 和直连 IP，重连时可以完全跳过发现服务。
+/// 条目格式：`relay:<url>` 或 `ip:<socket addr>`，解析不了的直接忽略。
+pub fn parse_peer_extra(
+    peer_id: &str,
+    relay_url: &str,
+    extra: &[String],
+) -> Result<EndpointAddr> {
     let id = EndpointId::from_str(peer_id).context("invalid peer id")?;
     let mut addrs: Vec<TransportAddr> = Vec::new();
     if !relay_url.is_empty() {
         let url = RelayUrl::from_str(relay_url).context("invalid relay url")?;
         addrs.push(TransportAddr::Relay(url));
+    }
+    for item in extra {
+        if let Some(u) = item.strip_prefix("relay:") {
+            if let Ok(url) = RelayUrl::from_str(u) {
+                addrs.push(TransportAddr::Relay(url));
+            }
+        } else if let Some(a) = item.strip_prefix("ip:") {
+            if let Ok(addr) = a.parse::<std::net::SocketAddr>() {
+                addrs.push(TransportAddr::Ip(addr));
+            }
+        }
     }
     Ok(EndpointAddr::from_parts(id, addrs))
 }

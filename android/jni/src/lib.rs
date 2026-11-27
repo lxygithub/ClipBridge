@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clipbridge_core::{net, protocol, transfer, ALPN};
 use iroh::endpoint::Connection;
-use iroh::Endpoint;
+use iroh::{Endpoint, TransportAddr};
 use jni::objects::{GlobalRef, JByteArray, JObject, JString, JValue};
 use jni::sys::{jboolean, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
@@ -237,13 +237,64 @@ impl Session {
     }
 
     async fn connect_once(&self) -> Result<Connection> {
-        let addr = net::parse_peer(&self.peer, &self.relay)?;
+        // 先带上一批「上次连成功时记下来的地址」：能跳过 DNS/pkarr 发现就直接连，
+        // 同一局域网里这一步能把重连从「看运气」变成「必成」。
+        let cached = self.cached_addrs();
+        let addr = net::parse_peer_extra(&self.peer, &self.relay, &cached)?;
         // 连接一定要有上限：没有超时的 connect 会在弱中继/待机断网时一挂几分钟，
         // supervisor 就卡在这里不动，看起来就是「手机一直在连、电脑端一直收不到」。
         tokio::time::timeout(Duration::from_secs(12), self.ep.connect(addr, ALPN))
             .await
             .map_err(|_| anyhow::anyhow!("connect timeout (12s)"))?
             .context("connect to windows")
+    }
+
+    /// 上次连成功时的对端地址缓存（`files/peer_addrs.json`）。
+    fn cached_addrs(&self) -> Vec<String> {
+        let raw = std::fs::read_to_string(self.dir.join("peer_addrs.json")).unwrap_or_default();
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(url) = v["relay"].as_str() {
+            if !url.is_empty() {
+                out.push(format!("relay:{url}"));
+            }
+        }
+        if let Some(list) = v["ips"].as_array() {
+            for ip in list.iter().filter_map(|x| x.as_str()).take(8) {
+                out.push(format!("ip:{ip}"));
+            }
+        }
+        out
+    }
+
+    /// 连上之后把这个对端现在可用的地址记下来，下次重连直接用。
+    fn save_addrs(&self, conn: &Connection) {
+        let mut relay = String::new();
+        let mut ips: Vec<String> = Vec::new();
+        for p in conn.paths().iter() {
+            match p.remote_addr() {
+                TransportAddr::Relay(url) => {
+                    if relay.is_empty() {
+                        relay = url.to_string();
+                    }
+                }
+                TransportAddr::Ip(addr) => {
+                    let s = addr.to_string();
+                    if !ips.contains(&s) {
+                        ips.push(s);
+                    }
+                }
+                _ => {}
+            }
+        }
+        ips.truncate(8);
+        if relay.is_empty() && ips.is_empty() {
+            return;
+        }
+        let json = serde_json::json!({ "relay": relay, "ips": ips });
+        let _ = std::fs::write(self.dir.join("peer_addrs.json"), json.to_string());
     }
 
     /// 连上后先发 HELLO（带已确认 seq + 本机名），让 Windows 补发错过的条目、
@@ -349,6 +400,9 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
         let sess = Arc::clone(&sess);
         async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            // 直连路径往往比「连上」晚几秒才出现，地址缓存要等它出现后再落盘一次，
+            // 否则记下来的只有 relay，下次还是得走公网发现。
+            let mut saved = false;
             loop {
                 tick.tick().await;
                 if conn.close_reason().is_some() {
@@ -384,6 +438,11 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                 };
                 if sess.current() {
                     *LINK.lock().unwrap() = text;
+                }
+                // 直连路径出现后再把地址存一次（这时 ips 才不是空的）
+                if !saved && matches!(best, Some((true, _))) {
+                    sess.save_addrs(&conn);
+                    saved = true;
                 }
             }
         }
@@ -435,7 +494,8 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
             let budget = if fg {
                 Duration::from_millis(2500)
             } else {
-                Duration::from_secs(6)
+                // 后台也别给 6 秒：一次探活最多 4 秒，两次失败加起来二十多秒就能有结论
+                Duration::from_secs(4)
             };
             let mut alive = probe_alive(&conn, &sess.dir, budget).await;
             // 前台再补一次短探活：偶发丢包不该把好链路判死，但真死了也不该拖两轮
@@ -703,6 +763,7 @@ async fn supervise(sess: Arc<Session>) {
         let recovered = match sess.connect_once().await {
             Ok(conn) => {
                 log_line(&sess.dir, "connect: ok");
+                sess.save_addrs(&conn);
                 if let Err(err) = sess.hello(&conn).await {
                     eprintln!("[jni] hello failed: {err:#}");
                     log_line(&sess.dir, &format!("hello failed: {err:#}"));
