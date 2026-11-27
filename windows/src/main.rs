@@ -111,7 +111,16 @@ fn main() -> Result<()> {
     // 默认静默（和以前一样只打自己的 println）；排查问题时设 RUST_LOG 再看 iroh 内部日志
     init_tracing();
 
-    let cli = Cli::parse();
+    // GUI 子系统下没有控制台可以接住 clap 的报错，所以双击（不带参数）直接当 serve 处理，
+    // 用户看到的就是托盘起来，而不是一个无声无息的退出。
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = if args.len() <= 1 {
+        let mut with_default = args.clone();
+        with_default.push("serve".into());
+        Cli::parse_from(with_default)
+    } else {
+        Cli::parse_from(args)
+    };
     // 先定输出出口再谈别的：GUI 子系统下没有控制台，println 写失败会 panic。
     // 只有"托盘模式"要脱离控制台，其余命令/headless 都贴着父终端打印。
     setup_stdio(&cli.dir, matches!(&cli.cmd, Cmd::Serve { headless: false, .. }));
