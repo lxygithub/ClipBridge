@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush,
     DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, LineTo, MoveToEx, Polygon,
-    GetStockObject, InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkColor, NULL_BRUSH, NULL_PEN, SetBkMode, SetTextColor, DT_CENTER,
+    GetStockObject, InvalidateRect, ReleaseDC, RoundRect, SelectObject, NULL_BRUSH, NULL_PEN, SetBkMode, SetTextColor, DT_CENTER,
     DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
     DT_RIGHT, DT_END_ELLIPSIS, BitBlt, SRCCOPY,
 };
@@ -44,8 +44,8 @@ use crate::queue::Store;
 const WM_APP_REFRESH: u32 = WM_APP + 10;
 const WM_TRAY: u32 = WM_APP + 1;
 const TIMER_TICK: usize = 1;
-
-const ID_LOG: i32 = 101;
+/// 复制/发送后的浮动提示，1.2 秒后自动消失
+const TIMER_HINT: usize = 2;
 
 const CMD_OPEN: usize = 2001;
 const CMD_AUTOSTART: usize = 2003;
@@ -73,27 +73,17 @@ const C_BORDER: u32 = 0x0032_2318; // #182332
 
 // 两块热区各自的底色，靠色相区分，不再用一条分隔线硬切
 const C_ZONE_TEXT_BG: u32 = 0x001C1E0E; // #0E1E1C 偏青
-const C_ZONE_TEXT_EDGE: u32 = 0x00353A1D; // #1D3A35
-const C_ZONE_FILE_BG: u32 = 0x000E181E; // #1E180E 偏暖
-const C_ZONE_FILE_EDGE: u32 = 0x001A2F3A; // #3A2F1A
 const C_ROW_HOVER: u32 = 0x00281D12; // #121D28
 const C_ROW_EDGE: u32 = 0x001C2A36; // #362A1C
-const C_TEXT_FG: u32 = 0x00D8_C4B0; // #B0C4D8 正文偏冷灰
 
 /// 窗口与控件共用的画刷/字体（进程生命周期内复用）。
 static BG_BRUSH: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
-static PANEL_BRUSH: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 static UI_FONT: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 static TITLE_FONT: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 static SMALL_FONT: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 
 fn bg_brush() -> HBRUSH {
     let raw = *BG_BRUSH.get_or_init(|| unsafe { CreateSolidBrush(C_BG) as isize });
-    raw as *mut core::ffi::c_void
-}
-
-fn panel_brush() -> HBRUSH {
-    let raw = *PANEL_BRUSH.get_or_init(|| unsafe { CreateSolidBrush(C_PANEL) as isize });
     raw as *mut core::ffi::c_void
 }
 
@@ -127,11 +117,6 @@ unsafe fn title_font() -> WPARAM {
 
 unsafe fn small_font() -> WPARAM {
     *SMALL_FONT.get_or_init(|| font_of(14, 400) as isize) as WPARAM
-}
-
-#[link(name = "uxtheme")]
-extern "system" {
-    fn SetWindowTheme(hwnd: HWND, app: *const u16, id: *const u16) -> i32;
 }
 
 #[link(name = "dwmapi")]
@@ -180,9 +165,14 @@ pub struct App {
     pub paused: AtomicBool,
     msg_hwnd: AtomicIsize,
     hist_hwnd: AtomicIsize,
-    log_hwnd: AtomicIsize,
+    /// 0 = 条目页，1 = 日志页（同一个窗口里翻页，不再单开窗口）
+    page: AtomicIsize,
     scroll: AtomicIsize,
     hover: AtomicIsize,
+    /// 悬浮在哪个热区：0 无、1 粘贴、2 选文件
+    zone_hover: AtomicIsize,
+    /// 底部浮动提示，1.2 秒后清掉
+    hint: Mutex<Option<String>>,
 }
 
 impl App {
@@ -204,9 +194,11 @@ impl App {
             paused: AtomicBool::new(false),
             msg_hwnd: AtomicIsize::new(0),
             hist_hwnd: AtomicIsize::new(0),
-            log_hwnd: AtomicIsize::new(0),
+            page: AtomicIsize::new(0),
             scroll: AtomicIsize::new(0),
             hover: AtomicIsize::new(-1),
+            zone_hover: AtomicIsize::new(0),
+            hint: Mutex::new(None),
         }
     }
 
@@ -254,6 +246,40 @@ impl App {
         if hwnd != 0 {
             unsafe { PostMessageW(hwnd as HWND, WM_APP_REFRESH, 0, 0) };
         }
+    }
+
+    /// 翻到条目页 / 日志页；两页共用一块列表区，只换数据源。
+    pub fn set_page(&self, page: isize) {
+        self.page.store(page, Ordering::Relaxed);
+        self.scroll.store(0, Ordering::Relaxed);
+        self.hover.store(-1, Ordering::Relaxed);
+        let hwnd = self.hist_hwnd.load(Ordering::Relaxed) as HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                refresh_rows(self, hwnd);
+                InvalidateRect(hwnd, ptr::null(), 0);
+            }
+        }
+    }
+
+    pub fn page(&self) -> isize {
+        self.page.load(Ordering::Relaxed)
+    }
+
+    /// 底部浮动提示（复制成功、发送等）。窗口在的话顺手起个 1.2 秒的定时器收尾。
+    pub fn set_hint(&self, text: &str) {
+        *self.hint.lock().unwrap() = Some(text.to_string());
+        let hwnd = self.hist_hwnd.load(Ordering::Relaxed) as HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                InvalidateRect(hwnd, ptr::null(), 0);
+                SetTimer(hwnd, TIMER_HINT, 1200, None);
+            }
+        }
+    }
+
+    fn clear_hint(&self) {
+        *self.hint.lock().unwrap() = None;
     }
 
     /// 把文件塞进 outbox，交给 outbox 监视器发出去。
@@ -350,29 +376,7 @@ pub fn run(app: Arc<App>) -> Result<()> {
         }
         app.hist_hwnd.store(hist as isize, Ordering::Relaxed);
         SendMessageW(hist, WM_SETICON, 1, icon as LPARAM);
-
-        // 日志窗口：平时不显示，点标题栏「日志」才弹出来
-        let log = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            wide("ClipBridge 日志").as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-            960,
-            160,
-            620,
-            520,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            hinst,
-            app_ptr,
-        );
-        if !log.is_null() {
-            app.log_hwnd.store(log as isize, Ordering::Relaxed);
-            SendMessageW(log, WM_SETICON, 1, make_icon(32) as LPARAM);
-            create_log_controls(log);
-            darken(log);
-            layout_log(log);
-        }
+        SendMessageW(hist, WM_SETICON, 0, make_icon(16) as LPARAM);
 
         darken(hist);
         layout(hist);
@@ -414,7 +418,6 @@ unsafe fn remove_tray(hwnd: HWND) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const App;
     let is_hist = !app.is_null() && (*app).hist_hwnd.load(Ordering::Relaxed) == hwnd as isize;
-    let is_log = !app.is_null() && (*app).log_hwnd.load(Ordering::Relaxed) == hwnd as isize;
 
     match msg {
         WM_CREATE => {
@@ -425,13 +428,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_SIZE => {
             if is_hist {
                 layout(hwnd);
-            } else if is_log {
-                layout_log(hwnd);
             }
             0
         }
         WM_TIMER => {
-            if is_hist && wp == TIMER_TICK {
+            if !is_hist {
+                return 0;
+            }
+            if wp == TIMER_HINT {
+                (*app).clear_hint();
+                KillTimer(hwnd, TIMER_HINT);
+                InvalidateRect(hwnd, ptr::null(), 0);
+            } else if wp == TIMER_TICK {
                 let changed = refresh_rows(&*app, hwnd);
                 let mut rc: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut rc);
@@ -459,7 +467,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_APP_REFRESH => {
             if is_hist {
                 refresh_rows(&*app, hwnd);
-                refresh_log(&*app);
                 InvalidateRect(hwnd, ptr::null(), 0);
             }
             0
@@ -467,8 +474,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_PAINT => {
             if is_hist {
                 paint(hwnd, &*app);
-            } else if is_log {
-                paint_log(hwnd, &*app);
             } else {
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
@@ -491,9 +496,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let mut rc: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut rc);
                 let idx = row_at(&*app, rc.right, pt);
+                let zone = {
+                    let (_, text_r, file_r) = zone_rects(rc.right);
+                    if hit(&text_r, pt) {
+                        1
+                    } else if hit(&file_r, pt) {
+                        2
+                    } else {
+                        0
+                    }
+                };
                 let prev = (*app).hover.swap(idx, Ordering::Relaxed);
-                if prev != idx {
-                    invalidate_rows(hwnd, rc.right);
+                let pz = (*app).zone_hover.swap(zone, Ordering::Relaxed);
+                if prev != idx || pz != zone {
+                    InvalidateRect(hwnd, ptr::null(), 0);
                 }
             }
             0
@@ -510,6 +526,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     (*app).queue_file(Path::new(&path)).ok();
                 }
                 DragFinish(hdrop);
+                (*app).set_hint("已加入发送队列");
                 refresh_rows(&*app, hwnd);
                 InvalidateRect(hwnd, ptr::null(), 0);
             }
@@ -536,7 +553,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if is_hist {
                 let mut rc: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut rc);
-                let (text_r, file_r) = zone_rects(rc.right);
+                let (_, text_r, file_r) = zone_rects(rc.right);
                 let (x, y) = (((lp & 0xFFFF) as i16) as i32, (((lp >> 16) & 0xFFFF) as i16) as i32);
                 let pt = POINT { x, y };
                 if hit(&text_r, pt) {
@@ -544,7 +561,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 } else if hit(&file_r, pt) {
                     pick_file(&*app);
                 } else if hit(&log_chip_rect(rc.right), pt) {
-                    show_log(&*app);
+                    let next = if (*app).page() == 0 { 1 } else { 0 };
+                    (*app).set_page(next);
                 } else {
                     activate_row(&*app, hwnd, pt);
                 }
@@ -552,10 +570,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_KEYDOWN => {
-            if wp == VK_V as usize && GetKeyState(VK_CONTROL as i32) < 0 {
-                if !app.is_null() {
-                    send_clipboard(&*app, hwnd);
-                }
+            if is_hist && wp == VK_V as usize && GetKeyState(VK_CONTROL as i32) < 0 {
+                // 悬浮在哪块都行，Ctrl+V 直接发剪贴板里的文本
+                send_clipboard(&*app, hwnd);
             }
             0
         }
@@ -564,7 +581,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return 0;
             }
             let id = (wp & 0xFFFF) as usize;
-            let code = ((wp >> 16) & 0xFFFF) as u32;
+            let _code = ((wp >> 16) & 0xFFFF) as u32;
             match id {
                 CMD_OPEN => show_history(&*app),
                 CMD_AUTOSTART => {
@@ -575,23 +592,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     remove_tray((*app).msg_hwnd.load(Ordering::Relaxed) as HWND);
                     DestroyWindow((*app).msg_hwnd.load(Ordering::Relaxed) as HWND);
                 }
-                _ if id == ID_LOG as usize && code == LBN_DBLCLK => {
-                    copy_log_item(&*app, hwnd);
-                }
                 _ => {}
             }
             0
         }
-        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
-            // 内置控件默认浅色，这里统一压成暗底浅字
-            let hdc = wp as HDC;
-            SetBkColor(hdc, C_PANEL);
-            SetTextColor(hdc, C_INK);
-            panel_brush() as LRESULT
-        }
         WM_CLOSE => {
-            // 主窗口、日志窗口都只隐藏；消息窗口才是退出入口
-            if is_hist || is_log {
+            // 窗口只隐藏；消息窗口才是退出入口
+            if is_hist {
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
             }
@@ -606,35 +613,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
-unsafe fn window_focused(hwnd: HWND) -> bool {
-    let fg = GetForegroundWindow();
-    !fg.is_null() && (fg == hwnd || GetAncestor(fg, GA_ROOT) == hwnd)
-}
-
 fn hit(rc: &RECT, pt: POINT) -> bool {
     pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
 }
 
-/// 顶部两块热区：左边粘贴文本、右边选择文件。各是一张独立卡片，留 10px 缝。
-fn zone_rects(width: i32) -> (RECT, RECT) {
+/// 顶部一张卡片，左右两半：左半粘贴文本（接 Ctrl+V），右半选择文件。
+/// 返回（整卡、左半、右半）。
+fn zone_rects(width: i32) -> (RECT, RECT, RECT) {
     let pad = 16;
     let top = 62;
-    let h = 86;
-    let gap = 10;
-    let card_w = (width - pad * 2 - gap) / 2;
-    let left = RECT {
+    let h = 82;
+    let card = RECT {
         left: pad,
-        top,
-        right: pad + card_w,
-        bottom: top + h,
-    };
-    let right = RECT {
-        left: pad + card_w + gap,
         top,
         right: width - pad,
         bottom: top + h,
     };
-    (left, right)
+    let mid = pad + (width - pad * 2) / 2;
+    let text = RECT {
+        left: pad,
+        top,
+        right: mid,
+        bottom: top + h,
+    };
+    let file = RECT {
+        left: mid,
+        top,
+        right: width - pad,
+        bottom: top + h,
+    };
+    (card, text, file)
 }
 
 fn badge_rect(width: i32) -> RECT {
@@ -689,40 +697,12 @@ fn row_at(app: &App, width: i32, pt: POINT) -> isize {
     }
 }
 
-/// 主窗口不再有子控件（列表是自绘的），只有日志窗口里有一个 LISTBOX。
-unsafe fn create_log_controls(hwnd: HWND) {
-    let font = ui_font();
-    let c = wide("LISTBOX");
-    let t = wide("");
-    let h = CreateWindowExW(
-        0,
-        c.as_ptr(),
-        t.as_ptr(),
-        WS_CHILD | WS_VISIBLE | LBS_NOTIFY as u32 | LBS_NOINTEGRALHEIGHT as u32 | WS_VSCROLL,
-        0,
-        0,
-        100,
-        24,
-        hwnd,
-        ID_LOG as usize as *mut core::ffi::c_void,
-        ptr::null_mut(),
-        ptr::null_mut(),
-    );
-    SendMessageW(h, WM_SETFONT, font, 1);
-}
-
-/// 暗色化：标题栏 + 日志列表滚动条。
+/// 暗色化标题栏。
 unsafe fn darken(hwnd: HWND) {
     let on: u32 = 1;
     let p = &on as *const u32 as *const core::ffi::c_void;
     if DwmSetWindowAttribute(hwnd, 20, p, 4) != 0 {
         DwmSetWindowAttribute(hwnd, 19, p, 4);
-    }
-
-    let dark = wide("DarkMode_Explorer");
-    let ctl = GetDlgItem(hwnd, ID_LOG);
-    if !ctl.is_null() {
-        SetWindowTheme(ctl, dark.as_ptr(), ptr::null());
     }
 }
 
@@ -737,20 +717,6 @@ unsafe fn layout(hwnd: HWND) {
     let max_scroll = max_scroll_for(&*app, rc.right, rc.bottom);
     let scroll = (*app).scroll.load(Ordering::Relaxed).min(max_scroll as isize);
     (*app).scroll.store(scroll, Ordering::Relaxed);
-    InvalidateRect(hwnd, ptr::null(), 0);
-}
-
-unsafe fn layout_log(hwnd: HWND) {
-    let mut rc: RECT = std::mem::zeroed();
-    GetClientRect(hwnd, &mut rc);
-    MoveWindow(
-        GetDlgItem(hwnd, ID_LOG),
-        16,
-        56,
-        rc.right - 32,
-        (rc.bottom - 56 - 16).max(40),
-        1,
-    );
     InvalidateRect(hwnd, ptr::null(), 0);
 }
 
@@ -773,17 +739,6 @@ unsafe fn scroll_by(app: &App, hwnd: HWND, delta: i32) {
     InvalidateRect(hwnd, ptr::null(), 0);
 }
 
-unsafe fn invalidate_rows(hwnd: HWND, width: i32) {
-    let mut rc: RECT = std::mem::zeroed();
-    GetClientRect(hwnd, &mut rc);
-    let area = RECT {
-        left: 0,
-        top: LIST_TOP - 4,
-        right: width,
-        bottom: rc.bottom,
-    };
-    InvalidateRect(hwnd, &area, 0);
-}
 
 unsafe fn paint(hwnd: HWND, app: &App) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -831,15 +786,16 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         DT_SINGLELINE | DT_VCENTER,
     );
 
-    // 日志入口：平时收起，点了才弹日志窗口
+    // 页面切换：条目页 ↔ 日志页，同一个窗口里翻
+    let on_log = app.page() == 1;
     let lg = log_chip_rect(w);
-    fill_round(hdc, lg, C_PANEL, C_BORDER, 14);
+    fill_round(hdc, lg, C_PANEL, if on_log { C_TEAL } else { C_BORDER }, 14);
     text_in(
         hdc,
-        "日志",
+        if on_log { "返回" } else { "日志" },
         lg,
         small_font(),
-        C_DIM,
+        if on_log { C_TEAL } else { C_DIM },
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
 
@@ -875,34 +831,43 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
 
-    // 两块热区：各是一张卡片，靠底色区分（左青右暖），不再共用一个大框
-    let (text_z, file_z) = zone_rects(w);
-    paint_zone(
+    // 一张卡片，左右两半：左半粘贴文本（悬浮即接收 Ctrl+V），右半选择文件
+    let (card, text_z, file_z) = zone_rects(w);
+    let zh = app.zone_hover.load(Ordering::Relaxed);
+    fill_round(hdc, card, C_PANEL, if zh != 0 { C_TEAL } else { C_BORDER }, 10);
+    // 两半之间的细线
+    let pen = CreatePen(PS_SOLID, 1, C_BORDER);
+    let old_pen = SelectObject(hdc, pen as _);
+    MoveToEx(hdc, text_z.right, card.top + 14, ptr::null_mut());
+    LineTo(hdc, text_z.right, card.bottom - 14);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen as _);
+
+    paint_half(
         hdc,
         text_z,
-        C_ZONE_TEXT_BG,
-        C_ZONE_TEXT_EDGE,
+        zh == 1,
         C_TEAL,
         "粘贴文本",
-        "Ctrl+V · 点这里直接发送",
+        "Ctrl+V 或点这里直接发送",
         true,
     );
-    paint_zone(
+    paint_half(
         hdc,
         file_z,
-        C_ZONE_FILE_BG,
-        C_ZONE_FILE_EDGE,
+        zh == 2,
         C_AMBER,
         "选择文件",
         "也可以把文件拖进窗口",
         false,
     );
 
-    // 列表标题
+    // 列表标题（两页共用同一块列表区）
+    let log_page = app.page() == 1;
     let count = app.rows.lock().unwrap().len();
     text_in(
         hdc,
-        "全部条目",
+        if log_page { "交换日志" } else { "全部条目" },
         RECT {
             left: 18,
             top: LIST_TOP - 30,
@@ -913,9 +878,14 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         C_FAINT,
         DT_SINGLELINE,
     );
+    let count_label = if log_page {
+        format!("共 {count} 条文本")
+    } else {
+        format!("共 {count} 条")
+    };
     text_in(
         hdc,
-        &format!("共 {count} 条"),
+        &count_label,
         RECT {
             left: 18,
             top: LIST_TOP - 30,
@@ -934,7 +904,11 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
     if rows.is_empty() {
         text_in(
             hdc,
-            "还没有条目",
+            if log_page {
+                "还没有日志"
+            } else {
+                "还没有条目"
+            },
             RECT {
                 left: 16,
                 top: LIST_TOP + 40,
@@ -965,72 +939,56 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
                 break;
             }
             let hot = hover == i as i32;
-            let accent = match row.kind {
-                RowKind::Text { .. } => C_TEAL,
-                RowKind::File { outgoing: true, .. } => C_AMBER,
-                RowKind::File { outgoing: false, .. } => C_TEAL,
-            };
+            let is_file = matches!(row.kind, RowKind::File { .. });
             fill_round(
                 hdc,
                 r,
                 if hot { C_ROW_HOVER } else { C_PANEL },
-                if hot { accent } else { C_ROW_EDGE },
+                if hot { C_ROW_EDGE } else { 0x0021_2B34 }, // #342B21 更淡的边
                 8,
             );
 
-            // 左侧竖条：一眼看出方向
-            let bar = RECT {
-                left: r.left + 1,
-                top: r.top + 12,
-                right: r.left + 4,
-                bottom: r.bottom - 12,
-            };
-            let bb = CreateSolidBrush(accent);
-            FillRect(hdc, &bar, bb);
-            DeleteObject(bb as _);
-
-            let icon_x = r.left + 18;
-            let icon_y = r.top + (ROW_H - 14) / 2;
-            draw_arrow(hdc, icon_x, icon_y, matches!(row.kind, RowKind::File { outgoing: true, .. }));
+            // 类型图标：文本=复制小方块，文件=文档
+            let icon_x = r.left + 15;
+            let icon_y = r.top + (ROW_H - 15) / 2;
+            if is_file {
+                draw_doc(hdc, icon_x, icon_y, if hot { C_TEAL } else { C_DIM });
+            } else {
+                draw_copy(hdc, icon_x, icon_y, if hot { C_TEAL } else { C_DIM });
+            }
 
             // 文件行右侧留出「打开所在目录」图标的位置
-            let is_file = matches!(row.kind, RowKind::File { .. });
             let folder_x = r.right - 16 - 18;
-            let meta_right = if is_file { folder_x - 10 } else { r.right - 16 };
+            let meta_right = if is_file { folder_x - 12 } else { r.right - 16 };
 
             text_in(
                 hdc,
                 &row.title,
                 RECT {
-                    left: r.left + 44,
-                    top: r.top + 8,
-                    right: meta_right - 90,
-                    bottom: r.bottom - 8,
+                    left: r.left + 40,
+                    top: r.top + 6,
+                    right: meta_right - 86,
+                    bottom: r.bottom - 6,
                 },
                 ui_font(),
-                C_TEXT_FG,
+                C_INK,
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
             text_in(
                 hdc,
                 &row.meta,
                 RECT {
-                    left: meta_right - 160,
-                    top: r.top + 8,
+                    left: meta_right - 150,
+                    top: r.top + 6,
                     right: meta_right,
-                    bottom: r.bottom - 8,
+                    bottom: r.bottom - 6,
                 },
                 small_font(),
                 C_FAINT,
                 DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
             );
             if is_file {
-                draw_folder(
-                    hdc,
-                    folder_x,
-                    r.top + (ROW_H - 14) / 2,
-                    if hot { C_AMBER } else { C_DIM },
-                );
+                draw_folder(hdc, folder_x, r.top + (ROW_H - 15) / 2, if hot { C_AMBER } else { C_DIM });
             }
         }
     }
@@ -1060,23 +1018,51 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         FillRect(hdc, &thumb, th);
         DeleteObject(th as _);
     }
+    drop(rows);
+
+    // 浮动提示：复制成功之类，1.2 秒自动消失
+    if let Some(text) = app.hint.lock().unwrap().clone() {
+        let tw = 200;
+        let pill = RECT {
+            left: (w - tw) / 2,
+            top: h - 52,
+            right: (w + tw) / 2,
+            bottom: h - 20,
+        };
+        fill_round(hdc, pill, 0x002B_4314u32, C_TEAL, 16);
+        text_in(
+            hdc,
+            &text,
+            pill,
+            small_font(),
+            C_TEAL,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+        );
+    }
 }
 
-/// 一块热区卡片：底色 + 边框 + 左侧图标 + 两行文案。
-#[allow(clippy::too_many_arguments)]
-unsafe fn paint_zone(
+/// 卡片的一半：左侧图标 + 两行文案；悬浮时整半泛一点底色。
+unsafe fn paint_half(
     hdc: HDC,
     rc: RECT,
-    bg: u32,
-    edge: u32,
+    hot: bool,
     accent: u32,
     title: &str,
     hint: &str,
     clipboard_icon: bool,
 ) {
-    fill_round(hdc, rc, bg, edge, 10);
-    let ix = rc.left + 18;
-    let iy = rc.top + 22;
+    if hot {
+        // 悬浮高亮：把这一半单独铺一层更亮的底色
+        let hl = RECT {
+            left: rc.left + 2,
+            top: rc.top + 2,
+            right: rc.right - 2,
+            bottom: rc.bottom - 2,
+        };
+        fill_round(hdc, hl, 0x0023_2A34u32, 0x0023_2A34u32, 9);
+    }
+    let ix = rc.left + 20;
+    let iy = rc.top + 20;
     if clipboard_icon {
         draw_clipboard(hdc, ix, iy, accent);
     } else {
@@ -1086,10 +1072,10 @@ unsafe fn paint_zone(
         hdc,
         title,
         RECT {
-            left: ix + 34,
-            top: rc.top + 16,
+            left: ix + 32,
+            top: rc.top + 14,
             right: rc.right - 12,
-            bottom: rc.top + 48,
+            bottom: rc.top + 44,
         },
         ui_font(),
         C_INK,
@@ -1099,52 +1085,17 @@ unsafe fn paint_zone(
         hdc,
         hint,
         RECT {
-            left: ix + 34,
-            top: rc.top + 46,
+            left: ix + 32,
+            top: rc.top + 44,
             right: rc.right - 12,
-            bottom: rc.top + 72,
+            bottom: rc.top + 68,
         },
         small_font(),
-        C_FAINT,
+        if hot { accent } else { C_FAINT },
         DT_SINGLELINE | DT_VCENTER,
     );
 }
 
-unsafe fn paint_log(hwnd: HWND, app: &App) {
-    let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let mut rc: RECT = std::mem::zeroed();
-    GetClientRect(hwnd, &mut rc);
-    FillRect(hdc, &rc, bg_brush());
-    SetBkMode(hdc, TRANSPARENT as i32);
-    text_in(
-        hdc,
-        "交换日志",
-        RECT {
-            left: 16,
-            top: 12,
-            right: rc.right - 16,
-            bottom: 48,
-        },
-        title_font(),
-        C_INK,
-        DT_SINGLELINE | DT_VCENTER,
-    );
-    text_in(
-        hdc,
-        &format!("共 {} 条文本 · 双击复制", app.items.lock().unwrap().len()),
-        RECT {
-            left: rc.right - 260,
-            top: 16,
-            right: rc.right - 16,
-            bottom: 44,
-        },
-        small_font(),
-        C_FAINT,
-        DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
-    );
-    EndPaint(hwnd, &ps);
-}
 
 fn fmt_rtt(ms: u64) -> String {
     if ms >= 1000 {
@@ -1176,31 +1127,6 @@ unsafe fn text_in(hdc: HDC, s: &str, mut rc: RECT, font: WPARAM, color: u32, fla
 }
 
 /// 行首的方向箭头：向上（发出去）/ 向下（收进来）。
-unsafe fn draw_arrow(hdc: HDC, x: i32, y: i32, up: bool) {
-    let color = if up { C_AMBER } else { C_TEAL };
-    let brush = CreateSolidBrush(color);
-    let pen = CreatePen(PS_SOLID, 1, color);
-    let ob = SelectObject(hdc, brush as _);
-    let op = SelectObject(hdc, pen as _);
-    let mut tri = if up {
-        [
-            POINT { x: x - 4, y: y + 10 },
-            POINT { x, y },
-            POINT { x: x + 4, y: y + 10 },
-        ]
-    } else {
-        [
-            POINT { x: x - 4, y },
-            POINT { x, y: y + 10 },
-            POINT { x: x + 4, y },
-        ]
-    };
-    Polygon(hdc, tri.as_mut_ptr(), 3);
-    SelectObject(hdc, op);
-    SelectObject(hdc, ob);
-    DeleteObject(pen as _);
-    DeleteObject(brush as _);
-}
 
 /// 粘贴区图标：一块剪贴板（板 + 顶部夹子 + 两条内容线）。
 unsafe fn draw_clipboard(hdc: HDC, x: i32, y: i32, color: u32) {
@@ -1254,6 +1180,39 @@ unsafe fn draw_clipboard(hdc: HDC, x: i32, y: i32, color: u32) {
     DeleteObject(brush as _);
 }
 
+/// 文本行图标：两张叠纸（点一下就复制）。
+unsafe fn draw_copy(hdc: HDC, x: i32, y: i32, color: u32) {
+    let pen = CreatePen(PS_SOLID, 1, color);
+    let old_pen = SelectObject(hdc, pen as _);
+    SelectObject(hdc, GetStockObject(NULL_BRUSH as i32) as _);
+    // 后面那张
+    RoundRect(hdc, x + 4, y + 1, x + 15, y + 12, 4, 4);
+    // 前面那张
+    RoundRect(hdc, x + 1, y + 4, x + 12, y + 15, 4, 4);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen as _);
+}
+
+/// 文件行图标：一张文档（右上角折角）。
+unsafe fn draw_doc(hdc: HDC, x: i32, y: i32, color: u32) {
+    let pen = CreatePen(PS_SOLID, 1, color);
+    let old_pen = SelectObject(hdc, pen as _);
+    SelectObject(hdc, GetStockObject(NULL_BRUSH as i32) as _);
+    let mut body = [
+        POINT { x, y },
+        POINT { x: x + 10, y },
+        POINT { x: x + 15, y: y + 5 },
+        POINT { x: x + 15, y: y + 15 },
+        POINT { x, y: y + 15 },
+    ];
+    Polygon(hdc, body.as_mut_ptr(), 5);
+    MoveToEx(hdc, x + 10, y, ptr::null_mut());
+    LineTo(hdc, x + 10, y + 5);
+    LineTo(hdc, x + 15, y + 5);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen as _);
+}
+
 /// 小文件夹图标（列表行右侧的「打开所在目录」按钮）。
 unsafe fn draw_folder(hdc: HDC, x: i32, y: i32, color: u32) {
     let brush = CreateSolidBrush(color);
@@ -1290,8 +1249,9 @@ unsafe fn draw_folder_big(hdc: HDC, x: i32, y: i32, color: u32) {
     DeleteObject(brush as _);
 }
 
-/// 主界面列表 = 文本条目 + 文件条目，按时间倒序合并。返回是否有变化。
+/// 列表数据：条目页 = 文本 + 文件；日志页 = 只有文本。返回是否有变化。
 unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
+    let log_page = app.page() == 1;
     let mut rows: Vec<Row> = Vec::new();
 
     for it in app.items.lock().unwrap().iter() {
@@ -1313,45 +1273,50 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
         });
     }
 
-    for (dir, outgoing) in [(&app.outbox, true), (&app.inbox, false)] {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let path = e.path();
-            let Ok(meta) = e.metadata() else { continue };
-            if !meta.is_file() {
+    if !log_page {
+        for (dir, outgoing) in [(&app.outbox, true), (&app.inbox, false)] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                let Ok(meta) = e.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                // 发送中的临时落盘文件不进列表
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if name.ends_with(".part") {
+                    continue;
+                }
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                rows.push(Row {
+                    kind: RowKind::File {
+                        path: path.clone(),
+                        outgoing,
+                    },
+                    mtime,
+                    title: name,
+                    meta: format!(
+                        "{} · {}",
+                        human_size(meta.len()),
+                        if outgoing { "已发" } else { "已收" }
+                    ),
+                });
             }
-            // 发送中的临时落盘文件不进列表
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if name.ends_with(".part") {
-                continue;
-            }
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            rows.push(Row {
-                kind: RowKind::File {
-                    path: path.clone(),
-                    outgoing,
-                },
-                mtime,
-                title: name,
-                meta: format!("{} · {}", human_size(meta.len()), if outgoing { "已发" } else { "已收" }),
-            });
         }
     }
 
     rows.sort_by_key(|r| std::cmp::Reverse(r.mtime));
     rows.truncate(200);
-
     let mut cur = app.rows.lock().unwrap();
     // 条目变化才重排，免得每 2 秒把滚动位置顶掉
     let same = cur.len() == rows.len()
@@ -1373,31 +1338,6 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
 }
 
 /// 日志窗口：文本条目一行一条（进列表前先清空，日志量不大，重排可接受）。
-unsafe fn refresh_log(app: &App) {
-    let hwnd = app.log_hwnd.load(Ordering::Relaxed) as HWND;
-    if hwnd.is_null() {
-        return;
-    }
-    let lb = GetDlgItem(hwnd, ID_LOG);
-    if lb.is_null() {
-        return;
-    }
-    SendMessageW(lb, LB_RESETCONTENT, 0, 0);
-    for it in app.items.lock().unwrap().iter() {
-        let head: String = it
-            .text
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(80)
-            .collect();
-        let line = format!("{}  {}", fmt_time(it.mtime), head.replace('\t', " "));
-        let w = wide(&line);
-        SendMessageW(lb, LB_ADDSTRING, 0, w.as_ptr() as LPARAM);
-    }
-    InvalidateRect(hwnd, ptr::null(), 0);
-}
 
 fn human_size(n: u64) -> String {
     const K: f64 = 1024.0;
@@ -1413,21 +1353,6 @@ fn human_size(n: u64) -> String {
     }
 }
 
-unsafe fn copy_log_item(app: &App, hwnd: HWND) {
-    let idx = SendMessageW(GetDlgItem(hwnd, ID_LOG), LB_GETCURSEL, 0, 0);
-    if idx < 0 {
-        return;
-    }
-    let text = app
-        .items
-        .lock()
-        .unwrap()
-        .get(idx as usize)
-        .map(|i| i.text.clone());
-    if let Some(t) = text {
-        write_clipboard(&t);
-    }
-}
 
 /// 点一行：文本 → 复制到剪贴板；文件 → 点右侧文件夹图标打开所在目录，点其它地方打开文件。
 unsafe fn activate_row(app: &App, hwnd: HWND, pt: POINT) {
@@ -1458,7 +1383,11 @@ unsafe fn activate_row(app: &App, hwnd: HWND, pt: POINT) {
     };
     match action {
         Some(Action::Copy(t)) => {
-            write_clipboard(&t);
+            if write_clipboard(&t) {
+                app.set_hint("已复制到剪贴板");
+            } else {
+                app.set_hint("复制失败，剪贴板被占用");
+            }
         }
         Some(Action::OpenDir(p)) => {
             let explorer = wide("explorer.exe");
@@ -1492,34 +1421,23 @@ enum Action {
     OpenFile(PathBuf),
 }
 
-/// 日志窗口按需弹出（启动时就已建好，这里只负责显示与刷新）。
-unsafe fn show_log(app: &App) {
-    let hwnd = app.log_hwnd.load(Ordering::Relaxed) as HWND;
-    if hwnd.is_null() {
-        return;
-    }
-    refresh_log(app);
-    ShowWindow(hwnd, SW_SHOW);
-    ShowWindow(hwnd, SW_RESTORE);
-    SetForegroundWindow(hwnd);
-    InvalidateRect(hwnd, ptr::null(), 0);
-}
-
 /// 把剪贴板里的文本发出去（不做后台监听，只有用户明确粘贴才发）。
 unsafe fn send_clipboard(app: &App, hwnd: HWND) {
     let Some(text) = read_clipboard_text() else {
+        app.set_hint("剪贴板里没有文本");
         return;
     };
     if text.trim().is_empty() {
-        MessageBoxW(
-            hwnd,
-            wide("剪贴板里没有文本。").as_ptr(),
-            wide("ClipBridge").as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
+        app.set_hint("剪贴板里没有文本");
         return;
     }
-    app.send_text(text);
+    let chars = text.chars().count();
+    if app.send_text(text) {
+        app.set_hint(&format!("已发送 {chars} 字到手机"));
+    } else {
+        app.set_hint("发送通道未就绪，稍后再试");
+    }
+    let _ = hwnd;
 }
 
 pub fn read_clipboard_text() -> Option<String> {
@@ -1556,7 +1474,8 @@ unsafe fn pick_file(app: &App) {
     ofn.lpstrFile = buf.as_mut_ptr();
     ofn.nMaxFile = buf.len() as u32;
     let filter = "所有文件\0*.*\0\0";
-    ofn.lpstrFilter = wide_embed(filter).as_ptr();
+    let filter_buf = wide_embed(filter);
+    ofn.lpstrFilter = filter_buf.as_ptr();
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if GetOpenFileNameW(&mut ofn) == 0 {
         return;
@@ -1644,8 +1563,10 @@ pub fn write_clipboard(text: &str) -> bool {
     }
 }
 
-/// 自绘图标：深底圆角方块 + 上下两条箭头，配色跟界面一致。
+/// 自绘图标：和手机端 launcher 同款 —— 蓝色圆角方块 + 白色阶梯块。
+/// 手机端 vector 用 108 视口，这里按比例缩放，两边看起来是同一个图标。
 unsafe fn make_icon(size: i32) -> HICON {
+    const BLUE: u32 = 0x00FF_6B2F; // #2F6BFF
     let screen = GetDC(ptr::null_mut());
     let hdc = CreateCompatibleDC(screen);
     let color = CreateCompatibleBitmap(screen, size, size);
@@ -1659,42 +1580,37 @@ unsafe fn make_icon(size: i32) -> HICON {
     };
     FillRect(hdc, &rc, bg_brush());
 
-    let pen = CreatePen(PS_SOLID, 2, C_TEAL);
-    SelectObject(hdc, pen as _);
-    let null_brush = GetStockObject(NULL_BRUSH as i32);
-    SelectObject(hdc, null_brush as _);
-    RoundRect(hdc, 2, 2, size - 2, size - 2, 9, 9);
+    // 蓝色圆角底（矢量里是直角方块，桌面图标按 Windows 习惯收个圆角）
+    let bg = CreateSolidBrush(BLUE);
+    let pen = CreatePen(PS_SOLID, 1, BLUE);
+    let old_brush = SelectObject(hdc, bg as _);
+    let old_pen = SelectObject(hdc, pen as _);
+    let r = (size * 22 / 108).max(2);
+    RoundRect(hdc, 0, 0, size, size, r, r);
 
-    // 向上的箭头
-    let cx = size / 2;
-    MoveToEx(hdc, cx, size * 62 / 100, ptr::null_mut());
-    LineTo(hdc, cx, size * 22 / 100);
-    let mut up = [
-        POINT { x: cx - size / 8, y: size * 30 / 100 },
-        POINT { x: cx, y: size * 18 / 100 },
-        POINT { x: cx + size / 8, y: size * 30 / 100 },
+    // 白色阶梯块：108 视口下的 (34,38)-(60,38)-(60,48)-(74,48)-(74,70)-(48,70)-(48,60)-(34,60)
+    let s = |v: i32| (v * size / 108) as i32;
+    let mut shape = [
+        POINT { x: s(34), y: s(38) },
+        POINT { x: s(60), y: s(38) },
+        POINT { x: s(60), y: s(48) },
+        POINT { x: s(74), y: s(48) },
+        POINT { x: s(74), y: s(70) },
+        POINT { x: s(48), y: s(70) },
+        POINT { x: s(48), y: s(60) },
+        POINT { x: s(34), y: s(60) },
     ];
-    let amber = CreateSolidBrush(C_AMBER);
-    let old_brush2 = SelectObject(hdc, amber as _);
-    Polygon(hdc, up.as_mut_ptr(), 3);
-    SelectObject(hdc, old_brush2);
+    let white = CreateSolidBrush(0x00FF_FFFF);
+    SelectObject(hdc, white as _);
+    SelectObject(hdc, GetStockObject(NULL_PEN as i32) as _);
+    Polygon(hdc, shape.as_mut_ptr(), 8);
 
-    // 向下的箭头，稍微错开，形成「双向」语义
-    MoveToEx(hdc, cx + size * 18 / 100, size * 34 / 100, ptr::null_mut());
-    LineTo(hdc, cx + size * 18 / 100, size * 72 / 100);
-    let mut down = [
-        POINT { x: cx + size * 6 / 100, y: size * 62 / 100 },
-        POINT { x: cx + size * 18 / 100, y: size * 80 / 100 },
-        POINT { x: cx + size * 30 / 100, y: size * 62 / 100 },
-    ];
-    let old_brush3 = SelectObject(hdc, amber as _);
-    SelectObject(hdc, pen as _);
-    Polygon(hdc, down.as_mut_ptr(), 3);
-    SelectObject(hdc, old_brush3);
-
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
     SelectObject(hdc, old);
-    DeleteObject(amber as _);
+    DeleteObject(white as _);
     DeleteObject(pen as _);
+    DeleteObject(bg as _);
 
     // 单色掩码全 0 = 整块可见
     let mask_bits = vec![0u8; ((size as usize + 15) / 16) * 2 * size as usize];
