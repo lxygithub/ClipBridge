@@ -48,8 +48,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 打印本机端点身份
-    Info,
+    /// 打印本机端点身份（--diag 额外打印 NAT 类型/公网映射，用于排查打洞）
+    Info {
+        /// 打洞诊断：NAT 类型、公网映射、relay 延迟、实际发布的候选地址
+        #[arg(long)]
+        diag: bool,
+        #[arg(long, default_value = clipbridge_core::net::DEFAULT_RELAY)]
+        relay: String,
+        /// 固定本地 UDP 端口（0 = 随机）；和 serve 用同一个端口才能判断端口映射是否生效
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
     /// 常驻：托盘 + 监听剪贴板 + 广播
     Serve {
         /// 不建托盘/窗口（自动化测试用）
@@ -58,6 +67,12 @@ enum Cmd {
         /// 钉死 relay；传空串 `--relay ""` 则交回官方默认地图自动选
         #[arg(long, default_value = clipbridge_core::net::DEFAULT_RELAY)]
         relay: String,
+        /// 固定本地 UDP 端口（0 = 随机）。固定后才能在路由器上做端口映射，这是提高打洞成功率最有效的一招
+        #[arg(long, default_value_t = clipbridge_core::net::DEFAULT_PORT)]
+        port: u16,
+        /// 只绑这块网卡（IP 或 auto）。绑单卡可避免把 WireGuard/Tailscale/ZeroTier/WSL 的地址一起发布出去
+        #[arg(long, default_value = "")]
+        bind_ip: String,
     },
     /// 向对端发送一段文本
     Send {
@@ -93,13 +108,26 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // 默认静默（和以前一样只打自己的 println）；排查问题时设 RUST_LOG 再看 iroh 内部日志
+    init_tracing();
+
     let cli = Cli::parse();
     let key_path = cli.dir.join("endpoint.key");
     let secret = net::load_or_create_secret(&key_path)?;
 
     match cli.cmd {
-        Cmd::Serve { headless, relay } => serve(cli.dir, secret, headless, relay),
-        Cmd::Info => block_on(info(secret)),
+        Cmd::Serve {
+            headless,
+            relay,
+            port,
+            bind_ip,
+        } => {
+            let opts = net_opts(relay, port, &bind_ip)?;
+            serve(cli.dir, secret, headless, opts)
+        }
+        Cmd::Info { diag, relay, port } => {
+            block_on(info(secret, &net_opts(relay, port, "")?, diag))
+        }
         Cmd::Send { peer, relay, text } => block_on(send(secret, &peer, &relay, &text)),
         Cmd::Recv { peer, relay } => block_on(recv(secret, &peer, &relay)),
         Cmd::SendFile { peer, relay, file } => block_on(send_file(secret, &peer, &relay, file)),
@@ -112,8 +140,24 @@ fn main() -> Result<()> {
     }
 }
 
-fn block_on<F: Future<Output = Result<()>>>(fut: F) -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+/// 设了 RUST_LOG 才开 iroh 内部日志；没设就保持安静。
+///
+/// 排查打洞时用：`$env:RUST_LOG="iroh=debug"; clipbridge.exe info --diag`
+fn init_tracing() {
+    let Ok(filter) = std::env::var("RUST_LOG") else {
+        return;
+    };
+    if filter.trim().is_empty() {
+        return;
+    }
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(filter))
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+fn block_on<F: Future<Output = Result<()>>>(fut: F) -> Result<()> {    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build runtime")?
@@ -128,9 +172,32 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
         .context("build runtime")
 }
 
-async fn info(secret: iroh::SecretKey) -> Result<()> {
-    let ep = net::build_endpoint(secret).await?;
+/// 把 CLI 的 relay/port/bind-ip 折成 [net::NetOptions]；`bind_ip=auto` 交给系统选默认出口网卡。
+fn net_opts(relay: String, port: u16, bind_ip: &str) -> Result<net::NetOptions> {
+    let bind_ip = match bind_ip.trim() {
+        "" => None,
+        "auto" | "AUTO" => {
+            let ip = net::detect_primary_ip().context(
+                "detect primary ip failed（无法连上公网就用具体 IP，别用 auto）",
+            )?;
+            println!("[bind] 自动选中的主网卡地址：{ip}");
+            Some(ip)
+        }
+        other => Some(other.parse().with_context(|| format!("invalid bind ip: {other}"))?),
+    };
+    Ok(net::NetOptions {
+        relay,
+        port,
+        bind_ip,
+    })
+}
+
+async fn info(secret: iroh::SecretKey, opts: &net::NetOptions, diag: bool) -> Result<()> {
+    let ep = net::build_endpoint_opts(secret, opts).await?;
     net::print_endpoint_info(&ep);
+    if diag {
+        net::print_diagnostics(&ep, 15).await;
+    }
     ep.close().await;
     Ok(())
 }
@@ -150,7 +217,7 @@ type Pendings = Arc<Mutex<HashMap<String, Pending>>>;
 /// 正在往外发的传输：id → 控制位，收到对端 `FILE_CANCEL` 时用来踩刹车。
 type Outgoing = Arc<Mutex<HashMap<String, Arc<transfer::TransferFlags>>>>;
 
-fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, relay: String) -> Result<()> {
+fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOptions) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
     let app = Arc::new(ui::App::new(Arc::clone(&store)));
 
@@ -160,7 +227,7 @@ fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, relay: String) -
     let net_store = Arc::clone(&store);
     let net_app = Arc::clone(&app);
     let net_dir = dir.clone();
-    let net_relay = relay.clone();
+    let net_opts = opts.clone();
     let net_thread = std::thread::Builder::new()
         .name("clipbridge-net".into())
         .spawn(move || {
@@ -171,7 +238,7 @@ fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, relay: String) -
                     return;
                 }
             };
-            if let Err(err) = rt.block_on(serve_net(secret, net_store, net_app, net_dir, net_relay)) {
+            if let Err(err) = rt.block_on(serve_net(secret, net_store, net_app, net_dir, net_opts)) {
                 eprintln!("[net] {err:#}");
             }
         })
@@ -198,9 +265,9 @@ async fn serve_net(
     store: Arc<Store>,
     app: Arc<ui::App>,
     dir: PathBuf,
-    relay: String,
+    opts: net::NetOptions,
 ) -> Result<()> {
-    let ep = net::build_endpoint_with_relay(secret, &relay).await?;
+    let ep = net::build_endpoint_opts(secret, &opts).await?;
     let peers: Peers = Arc::new(AsyncMutex::new(HashMap::new()));
     let pending: Pendings = Arc::new(Mutex::new(HashMap::new()));
     let outgoing: Outgoing = Arc::new(Mutex::new(HashMap::new()));
@@ -281,12 +348,34 @@ async fn serve_net(
         let pending = Arc::clone(&pending);
         let outgoing = Arc::clone(&outgoing);
         let inbox = inbox.clone();
+    let ep_for_peer = ep.clone();
         tokio::spawn(async move {
             let Ok(accepting) = incoming.accept() else { return };
             let Ok(conn) = accepting.await else { return };
             let id = conn.remote_id();
             println!("[conn] accepted {} ({id})", id.fmt_short());
             peers.lock().await.insert(id, conn.clone());
+            // 对端「发布了哪些候选地址」是判断它那边 QAD 成功没有的直接证据：
+            // 只有 relay 一条 = 它没测到自己公网映射，打洞不可能成
+            let ep2 = ep_for_peer.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                if let Some(info) = ep2.remote_info(id).await {
+                    let addrs: Vec<String> = info
+                        .addrs()
+                        .map(|a| {
+                            let used = match a.usage() {
+                                iroh::endpoint::TransportAddrUsage::Active => "*",
+                                _ => "",
+                            };
+                            format!("{used}{:?}", a.addr())
+                        })
+                        .collect();
+                    println!("[peer] {} 候选地址: {}", id.fmt_short(), addrs.join(", "));
+                } else {
+                    println!("[peer] {} 还没拿到候选地址", id.fmt_short());
+                }
+            });
             if let Err(err) = handle_conn(conn, store, pending, outgoing, inbox).await {
                 eprintln!("[conn] {err:#}");
             }

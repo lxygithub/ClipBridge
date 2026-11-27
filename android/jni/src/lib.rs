@@ -603,8 +603,67 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
 
     *slot().lock().unwrap() = Some(Arc::clone(&sess));
     let handle = rt().handle().clone();
+    // 手机侧没有任何 stdout：QAD/NAT 结论只能写进 files/diag.log 再 adb 拉出来。
+    // 这是判断「打洞为什么不成」的唯一现场证据（PC 侧只看得到手机发布的候选地址）。
+    {
+        let sess = Arc::clone(&sess);
+        handle.spawn(async move { diag_loop(sess).await });
+    }
     handle.spawn(supervise(sess));
     JNI_TRUE
+}
+
+/// 等 net_report 出来，把 NAT 结论追加到 `files/diag.log`，之后每 30s 记一次对端候选地址。
+async fn diag_loop(sess: Arc<Session>) {
+    let path = sess.dir.join("diag.log");
+    let mut w = sess.ep.net_report();
+    let mut report = None;
+    for _ in 0..60 {
+        if let Some(r) = iroh::Watcher::get(&mut w) {
+            let done = r.global_v4.is_some() || r.global_v6.is_some();
+            report = Some(r);
+            if done {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut text = format!("=== diag @ {stamp} ===\n");
+    match report {
+        Some(r) => {
+            text.push_str(&format!(
+                "global_v4={:?} global_v6={:?} udp_v4={} udp_v6={} mapping_varies_v4={:?} preferred_relay={:?}\n",
+                r.global_v4.map(|a| a.to_string()),
+                r.global_v6.map(|a| a.to_string()),
+                r.udp_v4,
+                r.udp_v6,
+                r.mapping_varies_by_dest_ipv4,
+                r.preferred_relay.map(|u| u.to_string()),
+            ));
+            if r.mapping_varies_by_dest_ipv4 == Some(true) {
+                text.push_str("NAT: 对称（打洞很难）\n");
+            } else if r.mapping_varies_by_dest_ipv4 == Some(false) {
+                text.push_str("NAT: 锥形（端口稳定）\n");
+            } else {
+                text.push_str("NAT: 未知\n");
+            }
+        }
+        None => text.push_str("net_report 未完成（relay 不可达）\n"),
+    }
+
+    // 对端（电脑）发布了哪些候选地址：同时能看出自己有没有被对端当成直连目标
+    if let Ok(peer_id) = sess.peer.parse::<iroh::EndpointId>() {
+        if let Some(info) = sess.ep.remote_info(peer_id).await {
+            let addrs: Vec<String> = info.addrs().map(|a| format!("{:?}", a.addr())).collect();
+            text.push_str(&format!("peer_addrs={}\n", addrs.join(", ")));
+            text.push_str(&format!("self_addrs={:?}\n", sess.ep.addr()));
+        }
+    }
+    let _ = std::fs::write(&path, &text);
 }
 
 /// `Native.stop()`
