@@ -6,7 +6,7 @@
 //! - 断线由 supervisor 循环重连（3s 退避），重连后发 HELLO 带本地 acked_seq，触发补发。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -21,6 +21,27 @@ use tokio::runtime::Runtime;
 
 static RT: OnceLock<Runtime> = OnceLock::new();
 static SESSION: OnceLock<Mutex<Option<Arc<Session>>>> = OnceLock::new();
+
+/// 会话代号：nativeStart 每建一次会话就 +1，nativeStop 也 +1。
+/// 老会话（已经被关掉的那个）如果还在写 UI，会把「未连接」盖到新会话的「已连接」上，
+/// 所以回调一律先比代号，不是当前会话就闭嘴。
+static SESSION_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// App 是否在前台。前台探活更勤（8s、两次失败就断），后台省电（20s、三次）。
+static FOREGROUND: AtomicBool = AtomicBool::new(false);
+
+/// 「现在就探一次」的唤醒闸门：进前台时踢一下，不用等到下一个 20s 周期。
+static KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// 上一次确认「链路真的活着」的时刻（epoch ms）。进前台时用它判断是不是该立刻重建。
+static LAST_ALIVE: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// 当前链路，形如 `direct|12` 或 `relay|312`（毫秒），空串表示没连上。
 /// UI 每 2 秒通过 `nativePathStatus` 读一次。
@@ -54,6 +75,8 @@ struct Session {
     relay: String,
     /// 本机显示名（HELLO 里带给电脑识别用）
     device: String,
+    /// 会话代号，见 SESSION_GEN
+    gen: u64,
     acked: AtomicU64,
     /// 已报价、等待数据流的文件：id → (offer, .part 路径)
     pending: Mutex<std::collections::HashMap<String, (transfer::Offer, PathBuf)>>,
@@ -64,7 +87,15 @@ struct Session {
 }
 
 impl Session {
+    /// 这一代会话还是不是当前的那个：老会话被关掉后不该再往 UI 写状态/条目。
+    fn current(&self) -> bool {
+        self.gen == SESSION_GEN.load(Ordering::SeqCst)
+    }
+
     fn state(&self, text: &str) {
+        if !self.current() {
+            return;
+        }
         let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
@@ -78,6 +109,9 @@ impl Session {
     }
 
     fn notify_text(&self, seq: u64, text: &str) {
+        if !self.current() {
+            return;
+        }
         let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
@@ -92,6 +126,9 @@ impl Session {
 
     /// 电脑发来一张图：PNG 已落地，交给 Kotlin 进时间线（缩略图由 Kotlin 自己解码）。
     fn notify_image(&self, seq: u64, path: &str, w: u32, h: u32) {
+        if !self.current() {
+            return;
+        }
         let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
@@ -110,6 +147,9 @@ impl Session {
     }
 
     fn notify_history(&self, json: &str) {
+        if !self.current() {
+            return;
+        }
         let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
@@ -122,7 +162,11 @@ impl Session {
         );
     }
 
-    fn notify_file(&self, name: &str, path: &str, size: u64) {        let Ok(mut env) = self.vm.attach_current_thread() else {
+    fn notify_file(&self, name: &str, path: &str, size: u64) {
+        if !self.current() {
+            return;
+        }
+        let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
         let (Ok(n), Ok(p)) = (env.new_string(name), env.new_string(path)) else {
@@ -140,7 +184,11 @@ impl Session {
         );
     }
 
-    fn notify_progress(&self, name: &str, done: u64, total: u64) {        let Ok(mut env) = self.vm.attach_current_thread() else {
+    fn notify_progress(&self, name: &str, done: u64, total: u64) {
+        if !self.current() {
+            return;
+        }
+        let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
         let Ok(n) = env.new_string(name) else { return };
@@ -229,6 +277,44 @@ impl Session {
     }
 }
 
+/// 探一次活：往电脑发 PING，等它把 PING 原样回回来，6 秒没回就算这次失败。
+/// 结果写进 `files/probe.log`（手机上没有 stdout，logcat 里看不到 Rust 的 eprintln）。
+async fn probe_alive(conn: &Connection, dir: &std::path::Path, budget: Duration) -> bool {
+    let t0 = std::time::Instant::now();
+    let res = tokio::time::timeout(budget, async {
+        let (mut s, mut r) = conn.open_bi().await?;
+        protocol::write_frame(&mut s, protocol::MSG_PING, b"").await?;
+        s.finish().ok();
+        let got = protocol::read_frame(&mut r).await?;
+        anyhow::ensure!(matches!(got, Some((protocol::MSG_PING, _))), "no ping echo");
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    let ok = matches!(&res, Ok(Ok(())));
+    let verdict = match &res {
+        Ok(Ok(())) => "ok".to_string(),
+        Ok(Err(err)) => format!("err: {err:#}"),
+        Err(_) => "timeout".to_string(),
+    };
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("probe.log"))
+        {
+            let _ = writeln!(
+                f,
+                "{} {} {}ms",
+                now_ms(),
+                verdict,
+                t0.elapsed().as_millis()
+            );
+        }
+    }
+    ok
+}
+
 /// 收连接上的所有推送帧，直到连接断开。
 async fn pump_conn(sess: Arc<Session>, conn: Connection) {
     {
@@ -236,95 +322,128 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
         *guard = Some(conn.clone());
     }
     sess.state("connected");
+    LAST_ALIVE.store(now_ms(), Ordering::SeqCst);
 
     // 链路状态：每 2 秒看一眼选中的路径（打洞成功 iroh 会新增 IP 路径并切过去），
     // 写进 LINK 供 UI 显示「直连 / 中继 + 延迟」。连接断开就清空。
     tokio::spawn({
         let conn = conn.clone();
+        let sess = Arc::clone(&sess);
         async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 tick.tick().await;
                 if conn.close_reason().is_some() {
-                    *LINK.lock().unwrap() = String::new();
+                    // 只有当前会话才有资格清空链路状态：被重建的老会话不能把新会话的显示抹掉
+                    if sess.current() {
+                        *LINK.lock().unwrap() = String::new();
+                    }
                     break;
                 }
-                let mut selected = None;
-                let mut any = None;
+                // 和中继/直连两条路并存：取「有直连且不慢于中继」的那条，
+                // 别只看 is_selected，iroh 切过去有滞后，会把 4ms 的局域网显示成 300ms。
+                let mut best: Option<(bool, u64)> = None;
                 for p in conn.paths().iter() {
                     let pair = (p.is_ip(), p.rtt().as_millis() as u64);
-                    if p.is_selected() {
-                        selected = Some(pair);
-                    }
-                    if any.is_none() {
-                        any = Some(pair);
-                    }
+                    best = Some(match best {
+                        None => pair,
+                        Some(cur) => {
+                            let better = match (cur.0, pair.0) {
+                                (false, true) => pair.1 + 20 <= cur.1,
+                                (true, false) => false,
+                                _ => pair.1 < cur.1,
+                            };
+                            if better { pair } else { cur }
+                        }
+                    });
                 }
-                let text = match selected.or(any) {
+                let text = match best {
                     Some((direct, rtt)) => {
                         let kind = if direct { "direct" } else { "relay" };
                         format!("{kind}|{rtt}")
                     }
                     None => String::new(),
                 };
-                *LINK.lock().unwrap() = text;
+                if sess.current() {
+                    *LINK.lock().unwrap() = text;
+                }
             }
         }
     });
 
-    // 心跳：每 20s 探一次活，靠电脑端把 PING 原样回回来判断链路是否真的活着。
-    // 这一步不能省：电脑端进程被关掉（或换了新实例）时，这条 QUIC 连接会变成半开，
-    // 手机侧读流不会立刻报错，UI 就一直显示「已连接」，而电脑端早就不认识这条连接了
-    // —— 用户看到的就是「手机说连着、电脑说没连」。
+    // 心跳：探活靠电脑端把 PING 原样回回来。这一步不能省：电脑端进程被关掉（或换了新实例）
+    // 时这条 QUIC 会变成半开，手机侧读流不报错，UI 就一直显示「已连接」，而电脑端早就不认识它了。
     //
-    // 间隔 20s 是为了省电：QUIC 层 keepalive 已经是 15s，这里再 10s 一次等于让无线反复被叫醒。
-    // 3 次收不到回显（≈1 分钟）就判定死链，直接断开让 supervisor 重连。
-    let mut hb = tokio::time::interval(std::time::Duration::from_secs(20));
+    // 节奏分前台/后台：
+    // - 前台 8s 一次、两次失败（≈16s）就断，用户盯着屏幕时绝不拖一分钟；
+    // - 后台 20s 一次、三次失败才断，让无线少被叫醒，省电优先。
     let mut hb_fails = 0u32;
     loop {
+        // 会话被换掉之后这条连接已经作废，老的心跳不能再发探活、更不能写 UI
+        if !sess.current() || conn.close_reason().is_some() {
+            break;
+        }
+        let fg = FOREGROUND.load(Ordering::Relaxed);
+        let wait = if fg { Duration::from_secs(5) } else { Duration::from_secs(20) };
+        // 前台这一轮里失败会立刻补一次短探活（见下），所以「这一次失败」就等于
+        // 「两次都没通」——不必再等下一个 5s 周期，用户盯着屏幕时那一轮太贵了。
+        let need = if fg { 1 } else { 3 };
         let pair = tokio::select! {
-            _ = hb.tick() => {
-                // 正在传文件（收或发）时不探活：数据流会把带宽占满，探活超时是误判
-                if sess.recv_flags.lock().unwrap().is_some()
-                    || !sess.outgoing.lock().unwrap().is_empty()
-                {
+            // 到点了
+            _ = tokio::time::sleep(wait) => None,
+            // 用户把 app 切回前台：短超时探一次（2.5s），探不通就当这条连接已经死了，
+            // 立刻断开让 supervisor 重连——后台那种「等三次失败」在用户盯着屏幕时太慢。
+            _ = KICK.notified() => {
+                if probe_alive(&conn, &sess.dir, Duration::from_millis(2500)).await {
+                    hb_fails = 0;
+                    LAST_ALIVE.store(now_ms(), Ordering::SeqCst);
                     continue;
                 }
-                let probe = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-                    let (mut s, mut r) = conn.open_bi().await?;
-                    protocol::write_frame(&mut s, protocol::MSG_PING, b"").await?;
-                    s.finish().ok();
-                    // 电脑端会把 PING 原地回一条，收到才算链路真的通
-                    let got = protocol::read_frame(&mut r).await?;
-                    anyhow::ensure!(
-                        matches!(got, Some((protocol::MSG_PING, _))),
-                        "no ping echo"
-                    );
-                    Ok::<(), anyhow::Error>(())
-                })
-                .await;
-                match &probe {
-                    Ok(Ok(())) => hb_fails = 0,
-                    Err(err) => eprintln!("[jni] ping: {err}"),
-                    _ => {}
-                }
-                if !matches!(&probe, Ok(Ok(()))) {
-                    hb_fails += 1;
-                }
-                if hb_fails >= 3 {
-                    eprintln!("[jni] link dead (3 missed pings), reconnecting");
-                    sess.state("disconnected");
-                    conn.close(0u32.into(), b"link dead");
-                    break;
-                }
+                sess.state("disconnected");
+                conn.close(0u32.into(), b"link dead");
+                break;
+            }
+            pair = conn.accept_bi() => Some(pair),
+        };
+        let Some(pair) = pair else {
+            // 正在传文件（收或发）时不探活：数据流会把带宽占满，探活超时是误判
+            if sess.recv_flags.lock().unwrap().is_some()
+                || !sess.outgoing.lock().unwrap().is_empty()
+            {
                 continue;
             }
-            pair = conn.accept_bi() => pair,
+            let budget = if fg {
+                Duration::from_millis(2500)
+            } else {
+                Duration::from_secs(6)
+            };
+            let mut alive = probe_alive(&conn, &sess.dir, budget).await;
+            // 前台再补一次短探活：偶发丢包不该把好链路判死，但真死了也不该拖两轮
+            if !alive && fg {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                alive = probe_alive(&conn, &sess.dir, Duration::from_secs(2)).await;
+            }
+            if alive {
+                hb_fails = 0;
+                LAST_ALIVE.store(now_ms(), Ordering::SeqCst);
+            } else {
+                hb_fails += 1;
+                eprintln!("[jni] ping failed ({hb_fails}/{need})");
+            }
+            if hb_fails >= need {
+                eprintln!("[jni] link dead ({hb_fails} missed pings), reconnecting");
+                sess.state("disconnected");
+                conn.close(0u32.into(), b"link dead");
+                break;
+            }
+            continue;
         };
         let (mut send, mut recv) = match pair {
             Ok(pair) => pair,
             Err(_) => break,
         };
+        // 收到电脑主动开的流本身就说明链路活着，记一笔（进前台时据此判断要不要重建）
+        LAST_ALIVE.store(now_ms(), Ordering::SeqCst);
         let sess = Arc::clone(&sess);
         tokio::spawn(async move {
             let Ok(Some((ty, payload))) = protocol::read_frame(&mut recv).await else {
@@ -542,22 +661,38 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
 }
 
 /// 常驻监督：连上 → 收推送 → 断了退避重连。
+/// 退避是 1s→2s→4s→封顶 8s：断链刚一发生就连着试几次（打洞/relay 一般都是瞬间恢复），
+/// 一直连不上再慢慢放长，别在没网的时候把无线一直叫醒。
 async fn supervise(sess: Arc<Session>) {
+    let mut backoff = Duration::from_secs(1);
     loop {
+        // 会话被换掉（nativeStart 重建 / nativeStop）之后这个循环就该退出，
+        // 否则老会话会拿着已经关掉的 endpoint 一直重连，和新会话抢同一个 key。
+        if !sess.current() {
+            break;
+        }
         sess.state("connecting");
-        match sess.connect_once().await {
+        let recovered = match sess.connect_once().await {
             Ok(conn) => {
                 if let Err(err) = sess.hello(&conn).await {
                     eprintln!("[jni] hello failed: {err:#}");
                 }
+                backoff = Duration::from_secs(1);
                 pump_conn(Arc::clone(&sess), conn).await;
+                true
             }
             Err(err) => {
                 eprintln!("[jni] connect failed: {err:#}");
                 sess.state("disconnected");
+                false
             }
+        };
+        if recovered {
+            // 刚刚还连上过，说明环境是通的，快速重试
+            backoff = Duration::from_secs(1);
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(8));
     }
 }
 
@@ -792,9 +927,17 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
     };
 
     // 已有会话先关掉，避免双端点抢同一个 key。
+    // 代号先 +1：老会话哪怕还有线程在跑，它的回调也会因为代号过气而全部失效。
+    let gen = SESSION_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     if let Some(old) = slot().lock().unwrap().take() {
+        let old_conn = old.conn.lock().unwrap().take();
         let ep = old.ep.clone();
-        rt().block_on(async move { ep.close().await });
+        rt().block_on(async move {
+            if let Some(c) = old_conn {
+                c.close(0u32.into(), b"restart");
+            }
+            ep.close().await;
+        });
     }
 
     let dir_path = PathBuf::from(&dir_s);
@@ -824,6 +967,7 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
         peer: peer_s,
         relay: relay_s,
         device: device_s,
+        gen,
         acked: AtomicU64::new(read_last_seq(&dir_path)),
         pending: Mutex::new(std::collections::HashMap::new()),
         outgoing: Mutex::new(std::collections::HashMap::new()),
@@ -906,9 +1050,45 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStop(
     _env: JNIEnv,
     _class: JObject,
 ) {
+    // 代号 +1：这条会话的回调从此一律失效，UI 不会被它写回「未连接」。
+    SESSION_GEN.fetch_add(1, Ordering::SeqCst);
     if let Some(old) = slot().lock().unwrap().take() {
-        rt().block_on(async move { old.ep.close().await });
+        let old_conn = old.conn.lock().unwrap().take();
+        rt().block_on(async move {
+            if let Some(c) = old_conn {
+                c.close(0u32.into(), b"stop");
+            }
+            old.ep.close().await;
+        });
     }
+    *LINK.lock().unwrap() = String::new();
+}
+
+/// `Native.setForeground(true|false)`：进前台立刻踢一次探活，后台把节奏放慢省电。
+#[no_mangle]
+pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeSetForeground(
+    _env: JNIEnv,
+    _class: JObject,
+    fg: jboolean,
+) {
+    let fg = fg != JNI_FALSE;
+    let was = FOREGROUND.swap(fg, Ordering::SeqCst);
+    if fg && !was {
+        KICK.notify_waiters();
+    }
+}
+
+/// `Native.idleMs()`：距离上次确认链路活着过了多久（毫秒）；-1 表示这次会话还没连过。
+#[no_mangle]
+pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeIdleMs(
+    _env: JNIEnv,
+    _class: JObject,
+) -> jlong {
+    let last = LAST_ALIVE.load(Ordering::SeqCst);
+    if last == 0 {
+        return -1;
+    }
+    now_ms().saturating_sub(last) as jlong
 }
 
 /// `Native.sendText(text)`：把手机剪贴板推给 PC。

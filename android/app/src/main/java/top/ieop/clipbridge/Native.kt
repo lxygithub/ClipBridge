@@ -15,6 +15,15 @@ object Native {
 
     external fun nativeStop()
 
+    /**
+     * 前台/后台切换：前台心跳 8s、两次失败就断；后台 20s、三次失败才断。
+     * 切到前台时顺便踢一次探活，用户一打开 app 就知道链路到底死没死。
+     */
+    external fun nativeSetForeground(fg: Boolean)
+
+    /** 距离上次确认链路活着过了多少毫秒；-1 表示这次会话还没连过。 */
+    external fun nativeIdleMs(): Long
+
     /** 发一条文本到 PC，返回是否收到 ACK。 */
     external fun nativeSendText(text: String): Boolean
 

@@ -729,13 +729,20 @@ async fn serve_net(
                     );
                 }
             });
+            let tail = conn.clone();
             if let Err(err) =
                 handle_conn(conn, id.to_string(), store, pending, outgoing, completions, inbox, app_h).await
             {
                 eprintln!("[conn] {err:#}");
             }
             peers.lock().await.remove(&id);
-            println!("[conn] closed {}", id.fmt_short());
+            // 断链要说清是谁断的、为什么断：手机侧 hb 判死会带 "link dead"，
+            // 本地主动收尾是 "done"，没 reason 说明是对端进程直接消失。
+            println!(
+                "[conn] closed {} reason={:?}",
+                id.fmt_short(),
+                tail.close_reason()
+            );
         });
     }
     Ok(())

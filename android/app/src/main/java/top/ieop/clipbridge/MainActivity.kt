@@ -148,18 +148,31 @@ class MainActivity : ComponentActivity() {
      */
     override fun onResume() {
         super.onResume()
+        // 前台节奏：更勤的探活，并且立刻踢一次（2.5s 探不通就断开重连，不等一分钟）
+        runCatching { Native.nativeSetForeground(true) }
         if (!prefs.isConfigured) return
-        val state = BridgeState.state.value
-        if (state == "connected" || state == "connecting") return
+        // 只有「很久很久没确认活着」才重建会话：重建要重开 endpoint，比让 supervisor
+        // 直接重连慢得多（实测能差十几秒），所以常规快恢复交给上面的探活。
+        val idle = runCatching { Native.nativeIdleMs() }.getOrDefault(-1L)
+        if (idle < RECOVER_IDLE_MS) return
         val now = System.currentTimeMillis()
         if (now - prefs.lastRecover < RECOVER_GAP_MS) return
         prefs.lastRecover = now
         SyncService.restart(this)
     }
 
+    override fun onPause() {
+        super.onPause()
+        // 后台把心跳放慢（20s、三次失败才断），省电优先
+        runCatching { Native.nativeSetForeground(false) }
+    }
+
     private companion object {
-        /** 两次「进前台就重连」之间的最小间隔 */
+        /** 两次「进前台就重建会话」之间的最小间隔 */
         const val RECOVER_GAP_MS = 15_000L
+
+        /** 超过这么久没确认过链路活着，才值得推翻重来（-1 表示还没连过） */
+        const val RECOVER_IDLE_MS = 45_000L
     }
 
     private fun askNotificationPermission() {
