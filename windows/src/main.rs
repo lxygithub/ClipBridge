@@ -404,6 +404,14 @@ fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOp
     let store = Arc::new(Store::open(dir.join("store"))?);
     let app = Arc::new(ui::App::new(Arc::clone(&store), &dir));
 
+    // 日志第一行带 pid：同时开过好几个实例时，一眼能看出这条日志是哪个进程写的
+    println!(
+        "[boot] pid={} version={} headless={}",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION"),
+        headless
+    );
+
     // 输出出口已经在 main 里的 setup_stdio 定好了（脱离控制台 / 落 serve.log / 贴终端）
 
     // 让自启命令写得回正确目录
