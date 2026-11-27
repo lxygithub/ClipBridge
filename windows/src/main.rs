@@ -7,6 +7,7 @@
 //!   clipbridge send --peer --relay --text   一次性发一段文本
 //!   clipbridge recv --peer --relay          调试用：作为对端接收广播
 
+mod clipimg;
 mod queue;
 mod ui;
 
@@ -442,8 +443,8 @@ async fn serve_net(
     println!("LISTENING");
 
     // 不再实时监听剪贴板：只有用户在窗口里粘贴 / 拖入文件才发。
-    // ui 侧通过 App::send_text 把文本送进来，和真正的广播逻辑共用一条通道。
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // ui 侧通过 App::send_text / send_image 把内容送进来，和真正的广播逻辑共用一条通道。
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ui::Outgoing>();
     app.set_sender(tx.clone());
 
     // 链路状态：每 2 秒看一眼选中路径，算出「直连 / 中继 + RTT」喂给标题栏那枚徽标。
@@ -486,21 +487,33 @@ async fn serve_net(
         let peers = Arc::clone(&peers);
         let app = Arc::clone(&app);
         tokio::spawn(async move {
-            while let Some(text) = rx.recv().await {
-                let seq = match store.push(&text) {
-                    Ok(seq) => seq,
-                    Err(err) => {
-                        eprintln!("[queue] push failed: {err:#}");
-                        continue;
+            // 图片不进 store（store 是文本库），seq 只是给手机端显示个编号
+            let mut img_seq = store.last_seq();
+            while let Some(msg) = rx.recv().await {
+                let (seq, text, image) = match msg {
+                    ui::Outgoing::Text(text) => {
+                        let seq = match store.push(&text) {
+                            Ok(seq) => seq,
+                            Err(err) => {
+                                eprintln!("[queue] push failed: {err:#}");
+                                continue;
+                            }
+                        };
+                        let head: String = text.chars().take(40).collect();
+                        println!(
+                            "[clip] #{seq} {}{}",
+                            head.replace('\n', " "),
+                            if text.chars().count() > 40 { "…" } else { "" }
+                        );
+                        app.add(seq, &text);
+                        (seq, Some(text), None)
+                    }
+                    ui::Outgoing::Image(png) => {
+                        img_seq += 1;
+                        println!("[img] #{} {} bytes out", img_seq, png.len());
+                        (img_seq, None, Some(png))
                     }
                 };
-                let head: String = text.chars().take(40).collect();
-                println!(
-                    "[clip] #{seq} {}{}",
-                    head.replace('\n', " "),
-                    if text.chars().count() > 40 { "…" } else { "" }
-                );
-                app.add(seq, &text);
 
                 let conns: Vec<Connection> = peers.lock().await.values().cloned().collect();
                 if conns.is_empty() {
@@ -509,8 +522,14 @@ async fn serve_net(
                 }
                 for conn in conns {
                     let text = text.clone();
+                    let image = image.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = push_text(conn, seq, &text).await {
+                        let res = match (text, image) {
+                            (Some(text), _) => push_text(conn, seq, &text).await,
+                            (None, Some(png)) => push_image(conn, seq, &png).await,
+                            (None, None) => Ok(()),
+                        };
+                        if let Err(err) = res {
                             eprintln!("[push] {err:#}");
                         }
                     });
@@ -679,6 +698,39 @@ async fn handle_conn(
                     let _ = protocol::write_frame(&mut send, protocol::MSG_ACK, b"").await;
                     let _ = send.finish();
                 }
+                protocol::MSG_CLIP_IMAGE_META => {
+                    // "<seq>|<PNG 字节>"：落盘 + 直接放进电脑剪贴板，用户切到微信就能 Ctrl+V
+                    let Some(pos) = payload.iter().position(|b| *b == b'|') else {
+                        eprintln!("[img] malformed payload");
+                        return;
+                    };
+                    let seq: u64 = String::from_utf8_lossy(&payload[..pos])
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    let png = &payload[pos + 1..];
+                    match clipimg::decode_png(png) {
+                        Some(bmp) => {
+                            app.save_image(png, bmp.w, bmp.h, false);
+                            let ok = clipimg::write_clipboard(&bmp);
+                            println!(
+                                "[img] #{seq} {}×{} · {} bytes{}",
+                                bmp.w,
+                                bmp.h,
+                                png.len(),
+                                if ok { " · 已放入剪贴板" } else { " · 剪贴板被占用" }
+                            );
+                            app.set_hint(if ok {
+                                "手机发来一张图，已放进剪贴板"
+                            } else {
+                                "收到图片，但剪贴板被别的程序占用"
+                            });
+                        }
+                        None => eprintln!("[img] bad png ({} bytes)", png.len()),
+                    }
+                    let _ = protocol::write_frame(&mut send, protocol::MSG_ACK, b"").await;
+                    let _ = send.finish();
+                }
                 protocol::MSG_FILE_OFFER => match serde_json::from_slice::<transfer::Offer>(&payload) {
                     Ok(offer) => match prepare_offer(&offer, &inbox, &pending) {
                         Ok(accept) => {
@@ -788,6 +840,18 @@ async fn push_text(conn: Connection, seq: u64, text: &str) -> Result<()> {
     protocol::write_frame(&mut send, protocol::MSG_CLIP_TEXT, payload.as_bytes()).await?;
     send.finish().ok();
     // 等 ACK 最多 3s，超时就认为离线
+    let _ = tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(64)).await;
+    Ok(())
+}
+
+/// 推一张图：payload = `<seq>|<PNG 原始字节>`，不套 base64（省一次编解码和 1/3 膨胀）。
+async fn push_image(conn: Connection, seq: u64, png: &[u8]) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await.context("open stream")?;
+    let mut payload = Vec::with_capacity(png.len() + 16);
+    payload.extend_from_slice(format!("{seq}|").as_bytes());
+    payload.extend_from_slice(png);
+    protocol::write_frame(&mut send, protocol::MSG_CLIP_IMAGE_META, &payload).await?;
+    send.finish().ok();
     let _ = tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(64)).await;
     Ok(())
 }

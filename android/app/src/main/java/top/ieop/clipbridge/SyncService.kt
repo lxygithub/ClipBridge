@@ -21,6 +21,8 @@ class SyncService : Service(), BridgeListener {
     override fun onCreate() {
         super.onCreate()
         Notifier.ensureChannels(this)
+        // 服务可能先于 Activity 起来（开机自启），历史也在这里读一次
+        BridgeState.attach(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -32,6 +34,17 @@ class SyncService : Service(), BridgeListener {
             started = false
             stopSelf()
             return START_NOT_STICKY
+        }
+
+        if (intent?.action == ACTION_RESTART) {
+            // 切到另一台电脑：先拆旧连接（nativeStop 会阻塞，放子线程），再按新配置重连
+            started = false
+            Thread {
+                Native.nativeStop()
+                val prefs = Prefs(this)
+                if (prefs.isConfigured) startBridge(prefs)
+            }.start()
+            return START_STICKY
         }
 
         if (intent?.action == ACTION_CANCEL_TRANSFER) {
@@ -100,6 +113,12 @@ class SyncService : Service(), BridgeListener {
         Notifier.showFile(this, name, size)
     }
 
+    override fun onImage(seq: Long, path: String, w: Long, h: Long) {
+        BridgeState.lastSeq.value = seq
+        BridgeState.pushImage(path, w.toInt(), h.toInt(), outgoing = false)
+        Notifier.showText(this, seq, "图片 ${w}×${h} · 已存到手机")
+    }
+
     override fun onFileProgress(name: String, done: Long, total: Long) {
         // total == 0 是「被取消」的约定信号
         if (total <= 0) Notifier.showFileCanceled(this, name)
@@ -130,6 +149,14 @@ class SyncService : Service(), BridgeListener {
         private const val TAG = "SyncService"
 
         const val ACTION_CANCEL_TRANSFER = "top.ieop.clipbridge.CANCEL_TRANSFER"
+        const val ACTION_RESTART = "top.ieop.clipbridge.RESTART"
+
+        /** 换了目标电脑：断开旧连接、按新配置重来。 */
+        fun restart(context: Context) {
+            context.startService(
+                Intent(context, SyncService::class.java).setAction(ACTION_RESTART)
+            )
+        }
 
         /** 通知栏「取消」按钮用：不新起服务，直接投给已运行的服务。 */
         fun cancelTransfer(context: Context) {

@@ -1,5 +1,7 @@
 package top.ieop.clipbridge
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -15,6 +17,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -58,6 +61,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import java.io.ByteArrayOutputStream
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -110,6 +117,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
         Notifier.ensureChannels(this)
+        // M4：把上次的历史读回时间线（最多 200 条）
+        BridgeState.attach(this)
         askNotificationPermission()
 
         // 已配对就顺手把常驻服务拉起来；只是建立连接，不会去读剪贴板
@@ -119,9 +128,11 @@ class MainActivity : ComponentActivity() {
             ChannelScreen(
                 peerId = prefs.peerId,
                 onSave = { peer, relay ->
+                    val changed = peer.trim() != prefs.peerId
                     prefs.peerId = peer
                     prefs.relay = relay
-                    SyncService.start(this)
+                    prefs.rememberPeer(peer, "")
+                    if (changed) SyncService.restart(this) else SyncService.start(this)
                 }
             )
         }
@@ -149,11 +160,15 @@ private fun ChannelScreen(
     val peerName by BridgeState.peerName.collectAsState()
 
     // 链路状态、对端名字和文件列表都来自 Rust 侧，2 秒拉一次（读 mutex/扫目录，开销可忽略）
+    val prefs = remember { Prefs(ctx) }
     LaunchedEffect(Unit) {
         while (true) {
             withContext(Dispatchers.IO) {
                 BridgeState.link.value = runCatching { Native.nativePathStatus() }.getOrDefault("")
-                BridgeState.peerName.value = runCatching { Native.nativePeerName() }.getOrDefault("")
+                val name = runCatching { Native.nativePeerName() }.getOrDefault("")
+                BridgeState.peerName.value = name
+                // 连上以后把电脑名字记进配对表，设置页里就是「我的主机」而不是一串 hex
+                if (name.isNotBlank() && peerId.isNotBlank()) prefs.rememberPeer(peerId, name)
                 val raw = runCatching { Native.nativeListFiles() }.getOrDefault("[]")
                 BridgeState.files.value = parseFiles(raw)
             }
@@ -288,10 +303,9 @@ private fun ChannelScreen(
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlineAction("发送当前剪贴板", Palette.teal, Modifier.weight(1f)) {
+                // 先文字，没文字再看是不是一张图（手机截图后直接「复制图片」很常见）
                 val text = readClipboard(ctx)
-                if (text.isNullOrBlank()) {
-                    toast(ctx, "剪贴板为空")
-                } else {
+                if (!text.isNullOrBlank()) {
                     Thread {
                         val ok = runCatching { Native.nativeSendText(text) }.getOrDefault(false)
                         if (ok) BridgeState.markSent(text)
@@ -299,7 +313,31 @@ private fun ChannelScreen(
                             toast(ctx, if (ok) "已发送到电脑" else "发送失败：未连接")
                         }
                     }.start()
+                    return@OutlineAction
                 }
+                val bmp = readClipboardImage(ctx)
+                if (bmp == null) {
+                    toast(ctx, "剪贴板为空")
+                    return@OutlineAction
+                }
+                Thread {
+                    val png = bitmapToPng(bmp)
+                    val ok = runCatching { Native.nativeSendImage(png) }.getOrDefault(false)
+                    if (ok) {
+                        // 发出去的图留一份本地副本，时间线里才有缩略图可看
+                        val dir = File(ctx.filesDir, "sent_images").apply { mkdirs() }
+                        val f = File(dir, "out_${System.currentTimeMillis()}.png")
+                        runCatching { f.writeBytes(png) }
+                        BridgeState.pushImage(f.absolutePath, bmp.width, bmp.height, outgoing = true)
+                    }
+                    (ctx as? ComponentActivity)?.runOnUiThread {
+                        toast(
+                            ctx,
+                            if (ok) "已发送图片 ${bmp.width}×${bmp.height}"
+                            else "发送失败：未连接"
+                        )
+                    }
+                }.start()
             }
             OutlineAction("发文件", Palette.amber, Modifier.weight(1f)) {
                 pickFile.launch(arrayOf("*/*"))
@@ -321,20 +359,56 @@ private fun ChannelScreen(
             },
             text = {
                 Column {
+                    item.imagePath?.let { path ->
+                        var bmp by remember(path) { mutableStateOf<Bitmap?>(null) }
+                        LaunchedEffect(path) {
+                            bmp = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(path) }
+                        }
+                        bmp?.let { b ->
+                            Image(
+                                b.asImageBitmap(),
+                                contentDescription = null,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 300.dp),
+                                contentScale = ContentScale.Fit
+                            )
+                            Spacer(Modifier.height(8.dp))
+                        }
+                    }
                     Text(item.text, color = Palette.ink, fontSize = 14.sp, lineHeight = 22.sp)
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        "${clockFormat.format(Date(item.ts))} · ${item.text.length} 字" +
-                            if (item.seq > 0) " · #${item.seq}" else "",
+                        "${clockFormat.format(Date(item.ts))} · " +
+                            if (item.imagePath != null) {
+                                "${item.imageW}×${item.imageH} 像素" +
+                                    if (item.seq > 0) " · #${item.seq}" else ""
+                            } else {
+                                "${item.text.length} 字" +
+                                    if (item.seq > 0) " · #${item.seq}" else ""
+                            },
                         color = Palette.faint,
                         fontSize = 10.sp
                     )
                     Spacer(Modifier.height(14.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         DetailAction("发回电脑") {
+                            val img = item.imagePath
                             Thread {
-                                val ok = runCatching { Native.nativeSendText(item.text) }.getOrDefault(false)
-                                if (ok) BridgeState.markSent(item.text)
+                                val ok = if (img != null) {
+                                    val png = runCatching { File(img).readBytes() }.getOrNull()
+                                    if (png == null) false
+                                    else runCatching { Native.nativeSendImage(png) }.getOrDefault(false)
+                                } else {
+                                    runCatching { Native.nativeSendText(item.text) }.getOrDefault(false)
+                                }
+                                if (ok) {
+                                    if (img != null) {
+                                        BridgeState.pushImage(img, item.imageW, item.imageH, outgoing = true)
+                                    } else {
+                                        BridgeState.markSent(item.text)
+                                    }
+                                }
                                 (ctx as? ComponentActivity)?.runOnUiThread {
                                     toast(ctx, if (ok) "已发回电脑" else "发送失败：未连接")
                                 }
@@ -349,11 +423,19 @@ private fun ChannelScreen(
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    writeClipboard(ctx, item.text)
-                    toast(ctx, "已复制到手机剪贴板")
-                    selected = null
-                }) { Text("复制", color = Palette.teal) }
+                val img = item.imagePath
+                if (img != null) {
+                    TextButton(onClick = {
+                        openFile(ctx, File(img))
+                        selected = null
+                    }) { Text("用别的应用打开", color = Palette.teal) }
+                } else {
+                    TextButton(onClick = {
+                        writeClipboard(ctx, item.text)
+                        toast(ctx, "已复制到手机剪贴板")
+                        selected = null
+                    }) { Text("复制", color = Palette.teal) }
+                }
             },
             dismissButton = {
                 TextButton(onClick = { selected = null }) {
@@ -364,7 +446,7 @@ private fun ChannelScreen(
     }
 
     if (settingsOpen) {
-        SettingsDialog(peerId, onClose = { settingsOpen = false }) { peer, relay ->
+        SettingsDialog(peerId, prefs.knownPeers(), onClose = { settingsOpen = false }) { peer, relay ->
             onSave(peer, relay)
             settingsOpen = false
         }
@@ -494,6 +576,23 @@ private fun TimelineRow(item: ClipItem, peer: String, onClick: () -> Unit) {
             ) {
                 Box(Modifier.width(2.dp).fillMaxHeight().background(accent))
                 Column(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
+                    item.imagePath?.let { path ->
+                        var bmp by remember(path) { mutableStateOf<Bitmap?>(null) }
+                        LaunchedEffect(path) {
+                            bmp = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(path) }
+                        }
+                        bmp?.let { b ->
+                            Image(
+                                b.asImageBitmap(),
+                                contentDescription = null,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 150.dp),
+                                contentScale = ContentScale.Fit
+                            )
+                            Spacer(Modifier.height(6.dp))
+                        }
+                    }
                     Text(
                         item.text,
                         color = Palette.ink,
@@ -540,6 +639,7 @@ private fun OutlineAction(
 @Composable
 private fun SettingsDialog(
     defaultPeer: String,
+    peers: List<KnownPeer>,
     onClose: () -> Unit,
     onSave: (String, String) -> Unit
 ) {
@@ -551,6 +651,38 @@ private fun SettingsDialog(
         title = { Text("连接设置", color = Palette.ink, fontSize = 14.sp) },
         text = {
             Column {
+                // M4 多机配对：配对过的电脑一键切，不必每次重新粘 64 位 id
+                if (peers.isNotEmpty()) {
+                    Text("已配对 · ${peers.size}", color = Palette.faint, fontSize = 9.sp, letterSpacing = 1.2.sp)
+                    Spacer(Modifier.height(6.dp))
+                    peers.forEach { p ->
+                        val current = p.id == defaultPeer
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 3.dp)
+                                .background(Palette.void, RoundedCornerShape(3.dp))
+                                .border(
+                                    1.dp,
+                                    if (current) Palette.teal else Palette.border,
+                                    RoundedCornerShape(3.dp)
+                                )
+                                .clickable { peer = p.id }
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(p.label, color = if (current) Palette.teal else Palette.ink, fontSize = 12.sp)
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                if (current) "当前" else p.id.take(8),
+                                color = Palette.faint,
+                                fontSize = 8.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
                 OutlinedTextField(
                     value = peer,
                     onValueChange = { peer = it },
@@ -747,6 +879,37 @@ private fun readClipboard(ctx: Context): String? {
 private fun writeClipboard(ctx: Context, text: String) {
     val cm = ctx.getSystemService(ClipboardManager::class.java) ?: return
     cm.setPrimaryClip(ClipData.newPlainText("ClipBridge", text))
+}
+
+/**
+ * 剪贴板里的图：Android 10+ 复制图片走的是 content Uri（`ClipData.Item.getUri`），
+ * 只有部分厂商会直接给 Bitmap，所以这里按 Uri 解码。
+ */
+private fun readClipboardImage(ctx: Context): Bitmap? {
+    val clip = ctx.getSystemService(ClipboardManager::class.java)?.primaryClip ?: return null
+    if (clip.itemCount == 0) return null
+    val uri = clip.getItemAt(0).uri ?: return null
+    return runCatching {
+        ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+    }.getOrNull()
+}
+
+/** 编成 PNG 上链路：长边压到 2000 以内，帧上限 16MB 兜得住。 */
+private fun bitmapToPng(src: Bitmap): ByteArray {
+    val max = 2000
+    val long = maxOf(src.width, src.height)
+    val bmp = if (long > max) {
+        val s = max.toFloat() / long
+        Bitmap.createScaledBitmap(
+            src,
+            (src.width * s).toInt().coerceAtLeast(1),
+            (src.height * s).toInt().coerceAtLeast(1),
+            true
+        )
+    } else src
+    val out = ByteArrayOutputStream()
+    bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+    return out.toByteArray()
 }
 
 private fun toast(ctx: Context, msg: String) =

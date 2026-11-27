@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use clipbridge_core::{net, protocol, transfer, ALPN};
 use iroh::endpoint::Connection;
 use iroh::Endpoint;
-use jni::objects::{GlobalRef, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JByteArray, JObject, JString, JValue};
 use jni::sys::{jboolean, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use tokio::runtime::Runtime;
@@ -90,8 +90,26 @@ impl Session {
         );
     }
 
-    fn notify_file(&self, name: &str, path: &str, size: u64) {
+    /// 电脑发来一张图：PNG 已落地，交给 Kotlin 进时间线（缩略图由 Kotlin 自己解码）。
+    fn notify_image(&self, seq: u64, path: &str, w: u32, h: u32) {
         let Ok(mut env) = self.vm.attach_current_thread() else {
+            return;
+        };
+        let Ok(p) = env.new_string(path) else { return };
+        let _ = env.call_method(
+            self.cb.as_obj(),
+            "onImage",
+            "(JLjava/lang/String;JJ)V",
+            &[
+                JValue::Long(seq as jlong),
+                JValue::Object(&JObject::from(p)),
+                JValue::Long(w as jlong),
+                JValue::Long(h as jlong),
+            ],
+        );
+    }
+
+    fn notify_file(&self, name: &str, path: &str, size: u64) {        let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
         let (Ok(n), Ok(p)) = (env.new_string(name), env.new_string(path)) else {
@@ -303,6 +321,39 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                     }
                     sess.notify_text(seq, text);
                 }
+                protocol::MSG_CLIP_IMAGE_META => {
+                    // "<seq>|<PNG 字节>"：落地到 inbox（和收到的文件同一个地方），再交给 Kotlin 进时间线
+                    let Some(pos) = payload.iter().position(|b| *b == b'|') else {
+                        eprintln!("[jni] malformed image payload");
+                        return;
+                    };
+                    let seq: u64 = String::from_utf8_lossy(&payload[..pos])
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    let png = &payload[pos + 1..];
+                    let inbox = sess.dir.join("inbox");
+                    let _ = std::fs::create_dir_all(&inbox);
+                    let ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let path = inbox.join(format!("clip_{ms}.png"));
+                    let size = match png_size(png) {
+                        Some((w, h)) => Some((w, h)),
+                        None => None,
+                    };
+                    if std::fs::write(&path, png).is_ok() {
+                        if let Some((w, h)) = size {
+                            let _ = protocol::write_frame(&mut send, protocol::MSG_ACK, b"").await;
+                            let _ = send.finish();
+                            sess.notify_image(seq, &path.to_string_lossy(), w, h);
+                            return;
+                        }
+                    }
+                    eprintln!("[jni] bad png ({} bytes)", png.len());
+                    let _ = send.finish();
+                }
                 protocol::MSG_PING => {
                     let _ = protocol::write_frame(&mut send, protocol::MSG_PING, b"").await;
                     let _ = send.finish();
@@ -509,6 +560,41 @@ impl Session {
         })
     }
 
+    /// 发一张图到 PC（Kotlin 侧已经把剪贴板图缩成 PNG）：写一帧 0x03，等 ACK。
+    fn push_image(&self, png: Vec<u8>) -> bool {
+        rt().block_on(async {
+            let conn = {
+                let guard = self.conn.lock().unwrap();
+                guard.clone()
+            };
+            let conn = match conn {
+                Some(c) => c,
+                None => match tokio::time::timeout(Duration::from_secs(8), self.connect_once()).await
+                {
+                    Ok(Ok(c)) => c,
+                    _ => return false,
+                },
+            };
+            let Ok((mut send, mut recv)) = conn.open_bi().await else {
+                return false;
+            };
+            let mut payload = Vec::with_capacity(png.len() + 16);
+            payload.extend_from_slice(b"0|");
+            payload.extend_from_slice(&png);
+            if protocol::write_frame(&mut send, protocol::MSG_CLIP_IMAGE_META, &payload)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            send.finish().ok();
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), protocol::read_frame(&mut recv)).await,
+                Ok(Ok(Some((protocol::MSG_ACK, _))))
+            )
+        })
+    }
+
     /// 发一个文件到 PC：OFFER → ACCEPT → 数据流；COMPLETE 由 pump 侧回调。
     fn send_file(&self, path: &str) -> bool {
         let p = PathBuf::from(path);
@@ -632,6 +718,13 @@ fn jstring_to_string(env: &mut JNIEnv, s: &JString) -> String {
     env.get_string(s)
         .map(|v| v.into())
         .unwrap_or_else(|_| String::new())
+}
+
+/// 只读 PNG 头拿宽高，不解像素（时间线里显示「图片 1080×2400」用）。
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    let reader = dec.read_info().ok()?;
+    Some((reader.info().width, reader.info().height))
 }
 
 /// `Native.start(dir, peerId, relayUrl, deviceName, listener)`
@@ -796,6 +889,26 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeSendText(
     let sess = slot().lock().unwrap().clone();
     match sess {
         Some(sess) if sess.push_text(&text) => JNI_TRUE,
+        _ => JNI_FALSE,
+    }
+}
+
+/// `Native.sendImage(pngBytes)`：把手机剪贴板里的图（已编码成 PNG）推给 PC。
+#[no_mangle]
+pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeSendImage(
+    mut env: JNIEnv,
+    _class: JObject,
+    bytes: JByteArray,
+) -> jboolean {
+    let Ok(png) = env.convert_byte_array(&bytes) else {
+        return JNI_FALSE;
+    };
+    if png.is_empty() || png.len() > 12 * 1024 * 1024 {
+        return JNI_FALSE;
+    }
+    let sess = slot().lock().unwrap().clone();
+    match sess {
+        Some(sess) if sess.push_image(png) => JNI_TRUE,
         _ => JNI_FALSE,
     }
 }

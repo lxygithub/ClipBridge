@@ -1,13 +1,21 @@
 package top.ieop.clipbridge
 
+import android.content.Context
 import kotlinx.coroutines.flow.MutableStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
 
 /** 一条历史条目（M1 只存内存 + 原生 side 的 seq 水位线，落盘历史留给后续里程碑）。 */
 data class ClipItem(
     val seq: Long,
     val text: String,
     val ts: Long = System.currentTimeMillis(),
-    val outgoing: Boolean = false
+    val outgoing: Boolean = false,
+    /** 图片条目：本地 PNG 路径；文本条目为 null */
+    val imagePath: String? = null,
+    val imageW: Int = 0,
+    val imageH: Int = 0
 )
 
 /** 跨界面共享的连接状态（Rust 回调线程写，UI 读）。 */
@@ -21,6 +29,8 @@ data class RecvFile(
 )
 
 object BridgeState {
+    private var historyFile: File? = null
+
     val state = MutableStateFlow("idle")
     val lastSeq = MutableStateFlow(0L)
 
@@ -41,13 +51,80 @@ object BridgeState {
         state.value = newState
     }
 
+    /**
+     * M4 历史持久化：时间线原来只活在内存里，杀进程就清空。
+     * 落到 `filesDir/history.json`（最多 200 条，和内存里的上限一致）。
+     */
+    fun attach(ctx: Context) {
+        if (historyFile != null) return
+        val f = File(ctx.filesDir, "history.json")
+        historyFile = f
+        runCatching {
+            if (!f.exists()) return@runCatching
+            val arr = JSONArray(f.readText())
+            val list = ArrayList<ClipItem>(arr.length())
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val path = o.optString("imagePath").ifBlank { null }
+                // 图片被清掉了就只留文字记录，不要把空路径塞回列表
+                if (path != null && !File(path).exists()) continue
+                list += ClipItem(
+                    seq = o.optLong("seq", 0),
+                    text = o.optString("text"),
+                    ts = o.optLong("ts", System.currentTimeMillis()),
+                    outgoing = o.optBoolean("outgoing", false),
+                    imagePath = path,
+                    imageW = o.optInt("imageW", 0),
+                    imageH = o.optInt("imageH", 0)
+                )
+            }
+            items.value = list.take(200)
+        }
+    }
+
+    private fun persist() {
+        val f = historyFile ?: return
+        runCatching {
+            val arr = JSONArray()
+            items.value.take(200).forEach { it ->
+                arr.put(JSONObject().apply {
+                    put("seq", it.seq)
+                    put("text", it.text)
+                    put("ts", it.ts)
+                    put("outgoing", it.outgoing)
+                    it.imagePath?.let { p ->
+                        put("imagePath", p)
+                        put("imageW", it.imageW)
+                        put("imageH", it.imageH)
+                    }
+                })
+            }
+            f.writeText(arr.toString())
+        }
+    }
+
     fun push(item: ClipItem) {
         items.value = (listOf(item) + items.value).take(200)
         if (item.outgoing) sentCount.value += 1
         if (item.seq > lastSeq.value) lastSeq.value = item.seq
+        persist()
     }
 
     fun markSent(text: String) {
         push(ClipItem(seq = 0, text = text, outgoing = true, ts = System.currentTimeMillis()))
+    }
+
+    /** 图片条目：`path` 是本地 PNG（收到的落 inbox，发出去的落 sent_images）。 */
+    fun pushImage(path: String, w: Int, h: Int, outgoing: Boolean) {
+        push(
+            ClipItem(
+                seq = 0,
+                text = "图片 · ${w}×${h}",
+                outgoing = outgoing,
+                imagePath = path,
+                imageW = w,
+                imageH = h
+            )
+        )
     }
 }

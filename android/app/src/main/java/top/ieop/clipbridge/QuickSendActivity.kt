@@ -2,12 +2,15 @@ package top.ieop.clipbridge
 
 import android.content.ClipboardManager
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
@@ -75,16 +78,22 @@ class QuickSendActivity : ComponentActivity() {
      */
     private fun sendClipboard(attempt: Int) {
         val text = readClip()
-        if (text.isNullOrBlank()) {
-            if (attempt < 4) {
-                window.decorView.postDelayed({ sendClipboard(attempt + 1) }, 150)
-            } else {
-                toast("剪贴板为空")
-                finish()
-            }
+        if (!text.isNullOrBlank()) {
+            runSend(text)
             return
         }
-        runSend(text)
+        // 没文字再当图片试一次：截图后「复制图片」是手机上最常见的用法
+        val png = readClipImage()
+        if (png != null) {
+            runSendImage(png)
+            return
+        }
+        if (attempt < 4) {
+            window.decorView.postDelayed({ sendClipboard(attempt + 1) }, 150)
+        } else {
+            toast("剪贴板为空")
+            finish()
+        }
     }
 
     private fun readClip(): String? = runCatching {
@@ -93,6 +102,48 @@ class QuickSendActivity : ComponentActivity() {
         if (clip == null || clip.itemCount == 0) null
         else clip.getItemAt(0).text?.toString()
     }.getOrNull()
+
+    /** 剪贴板里的图（content Uri）→ 压好的 PNG 字节。 */
+    private fun readClipImage(): ByteArray? = runCatching {
+        val clip = getSystemService(ClipboardManager::class.java)?.primaryClip ?: return null
+        if (clip.itemCount == 0) return null
+        val uri = clip.getItemAt(0).uri ?: return null
+        val bmp: Bitmap = contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it)
+        } ?: return null
+        val long = maxOf(bmp.width, bmp.height)
+        val scaled = if (long > 2000) {
+            val s = 2000f / long
+            Bitmap.createScaledBitmap(
+                bmp,
+                (bmp.width * s).toInt().coerceAtLeast(1),
+                (bmp.height * s).toInt().coerceAtLeast(1),
+                true
+            )
+        } else bmp
+        ByteArrayOutputStream().use { out ->
+            scaled.compress(Bitmap.CompressFormat.PNG, 100, out)
+            out.toByteArray()
+        }
+    }.getOrNull()
+
+    private fun runSendImage(png: ByteArray) {
+        Thread({
+            var ok = false
+            var tries = 0
+            while (!ok && tries < 12) {
+                ok = runCatching { Native.nativeSendImage(png) }.getOrDefault(false)
+                if (!ok) {
+                    tries++
+                    Thread.sleep(300)
+                }
+            }
+            runOnUiThread {
+                toast(if (ok) "已发送图片到电脑" else "发送失败：电脑未连接")
+                finish()
+            }
+        }, "quick-send-image").start()
+    }
 
     private fun sendItem(intent: Intent) {
         val text = intent.getStringExtra(Intent.EXTRA_TEXT)

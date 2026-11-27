@@ -21,6 +21,9 @@ object Native {
     /** 发一个文件到 PC；返回是否把数据写完了（校验结果走 onFileSent）。 */
     external fun nativeSendFile(path: String): Boolean
 
+    /** 发一张图（PNG 字节，Kotlin 侧已编码）；返回是否收到 ACK。 */
+    external fun nativeSendImage(png: ByteArray): Boolean
+
     /** 取消当前正在接收的传输；返回是否真的有一笔在跑。 */
     external fun nativeCancelTransfer(): Boolean
 
@@ -46,6 +49,9 @@ interface BridgeListener {
 
     /** 文件落地完成（当前落在 app 私有目录 inbox/ 下）。 */
     fun onFile(name: String, path: String, size: Long) {}
+
+    /** 电脑发来一张图：PNG 已落在 inbox/，UI 用来显示缩略图。 */
+    fun onImage(seq: Long, path: String, w: Long, h: Long) {}
 
     /** 文件接收进度，用于进度通知。 */
     fun onFileProgress(name: String, done: Long, total: Long) {}

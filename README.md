@@ -24,7 +24,9 @@ Windows ↔ Android 的剪贴板 / 文件直传工具。传输走 [iroh](https:/
 | Windows 常驻：托盘、`Ctrl+Alt+H`、开机自启、`>=5MB` 日志轮转 | ✅ |
 | 手机常驻前台服务（`specialUse`，MIN 通知），20s 心跳探活 + 3s 退避重连 | ✅ |
 | 直连/中继徽标（RTT 按 60/160ms 分档）+ `info --diag` NAT 诊断 | ✅ |
-| 手机端历史持久化、多台电脑配对、图片剪贴板 | ⬜ |
+| 图片剪贴板：电脑 `Ctrl+V` 发图（CF_DIB → PNG）、手机收图落 `inbox/` + 缩略图、手机「复制图片」也能发 | ✅ |
+| 手机端历史持久化（`filesDir/history.json`，200 条） | ✅ |
+| 多台电脑配对（记住每次连上的电脑，设置页一键切换） | ✅ |
 | 自建 relay（跨网大文件只有几十 KB/s） | ⬜ 可选 |
 
 ## 架构
@@ -37,7 +39,8 @@ Android (SyncService + Rust core .so)  ──iroh/QUIC──►  Windows (clipbr
 
 - **控制面**：一条常驻双向流，帧格式 `[type u8][len u32 LE][payload]`
   - `HELLO 0x01`：`v1|<last_seq>|<device_name>` —— 手机用它补发 + 报名字；电脑连上后反向发 `v1|0|<COMPUTERNAME>` 让手机显示电脑名
-  - `CLIP_TEXT 0x02` / `ACK 0x20` / `PING 0x21`
+  - `CLIP_TEXT 0x02`：`<seq>|<text>`；`CLIP_IMAGE 0x03`：`<seq>|<PNG 原始字节>`（不套 base64，单帧上限 16MB，两端发送前压到 12MB 内）
+  - `ACK 0x20` / `PING 0x21`
   - `FILE_OFFER 0x10` / `ACCEPT 0x11` / `REJECT 0x12` / `COMPLETE 0x13` / `PAUSE 0x14` / `RESUME 0x15` / `CANCEL 0x16` / `DATA 0x17`
 - **发现**：`presets::N0`（`dns.iroh.link`），只凭 `EndpointId` 就能连；relay 区域会变，不写死
 - **不丢**：电脑端每条文本落 `store/items/<seq>.txt`，手机 `HELLO` 带 `last_seq` 触发补发
@@ -98,6 +101,7 @@ store/items/<seq>.txt   文本队列（也是补发源）
 inbox/                  收到的文件（电脑端落地）
 outbox/                 投递即推；对端 COMPLETE 后才移到 outbox/sent/
 outbox/sent/            已发送（仍会列在主界面里）
+images/                 剪贴板图片：out_<ms>_<w>x<h>.png（发出的）/ in_...（收到的）
 endpoint.key            设备身份（== EndpointId，丢了就要重配对）
 serve.log               常驻日志（>5MB 轮转到 serve.log.1）
 ```
@@ -172,8 +176,8 @@ cargo run -p clipbridge -- info --diag       # NAT / relay 体检
 - [x] M1 文本双向 + Windows 常驻
 - [x] M2 文件双向（`.part` 断点、SHA256、≤2GB、同名去重）
 - [x] M3 双端 UI 改版（手动发送、单列表、日志同窗、设备名、方向配色）
-- [ ] M4 手机端历史持久化、多台电脑配对
-- [ ] M5 图片剪贴板（DIB → PNG）
+- [x] M4 手机端历史持久化、多台电脑配对
+- [x] M5 图片剪贴板（DIB → PNG）
 - [ ] M6 自建 relay（可选，改善跨网带宽）
 
 ## License

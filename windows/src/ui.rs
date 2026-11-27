@@ -39,6 +39,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::clipimg;
 use crate::queue::Store;
 
 const WM_APP_REFRESH: u32 = WM_APP + 10;
@@ -147,10 +148,11 @@ pub struct LinkInfo {
     pub rtt_ms: u64,
 }
 
-/// 列表里的一行：要么是一条文本，要么是一个文件。
+/// 列表里的一行：文本 / 文件 / 剪贴板图片。
 pub enum RowKind {
     Text { text: String },
     File { path: PathBuf },
+    Image { path: PathBuf },
 }
 
 pub struct Row {
@@ -173,7 +175,11 @@ pub struct App {
     peer_name: Mutex<String>,
     inbox: PathBuf,
     outbox: PathBuf,
-    sender: Mutex<Option<UnboundedSender<String>>>,
+    /// 剪贴板图片落地目录（`in_`/`out_` 前缀区分收发的方向）
+    images: PathBuf,
+    /// 列表缩略图缓存：路径 → (mtime, 位图)
+    thumbs: Mutex<std::collections::HashMap<PathBuf, (u64, clipimg::Thumb)>>,
+    sender: Mutex<Option<UnboundedSender<Outgoing>>>,
     pub paused: AtomicBool,
     msg_hwnd: AtomicIsize,
     hist_hwnd: AtomicIsize,
@@ -185,6 +191,12 @@ pub struct App {
     zone_hover: AtomicIsize,
     /// 底部浮动提示，1.2 秒后清掉
     hint: Mutex<Option<String>>,
+}
+
+/// 交给网络线程的一份待发内容：文本走 store 排队，图片直接带着 PNG 字节走。
+pub enum Outgoing {
+    Text(String),
+    Image(Vec<u8>),
 }
 
 impl App {
@@ -203,6 +215,8 @@ impl App {
             peer_name: Mutex::new(String::new()),
             inbox: dir.join("inbox"),
             outbox: dir.join("outbox"),
+            images: dir.join("images"),
+            thumbs: Mutex::new(std::collections::HashMap::new()),
             sender: Mutex::new(None),
             paused: AtomicBool::new(false),
             msg_hwnd: AtomicIsize::new(0),
@@ -216,15 +230,81 @@ impl App {
     }
 
     /// 网络线程把"发一段文本"的通道交进来（手动粘贴走这里）。
-    pub fn set_sender(&self, tx: UnboundedSender<String>) {
+    pub fn set_sender(&self, tx: UnboundedSender<Outgoing>) {
         *self.sender.lock().unwrap() = Some(tx);
     }
 
     pub fn send_text(&self, text: String) -> bool {
         match self.sender.lock().unwrap().as_ref() {
-            Some(tx) => tx.send(text).is_ok(),
+            Some(tx) => tx.send(Outgoing::Text(text)).is_ok(),
             None => false,
         }
+    }
+
+    /// 发一张已编码好的 PNG。图片不写 store（文本库只存字），只在 images 目录留一份可回看。
+    pub fn send_image(&self, png: Vec<u8>, w: u32, h: u32) -> bool {
+        self.save_image(&png, w, h, true);
+        match self.sender.lock().unwrap().as_ref() {
+            Some(tx) => tx.send(Outgoing::Image(png)).is_ok(),
+            None => false,
+        }
+    }
+
+    /// 落盘一张图片：文件名里带方向和尺寸，列表就不必每次解码 PNG 才知道多大。
+    /// `outgoing` = 电脑发出去的（`out_` 前缀），否则是手机发来的（`in_`）。
+    pub fn save_image(&self, png: &[u8], w: u32, h: u32, outgoing: bool) -> Option<PathBuf> {
+        let _ = std::fs::create_dir_all(&self.images);
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        let name = format!(
+            "{}_{ms:013}_{w}x{h}.png",
+            if outgoing { "out" } else { "in" }
+        );
+        let path = self.images.join(name);
+        std::fs::write(&path, png).ok()?;
+        self.refresh();
+        Some(path)
+    }
+
+    /// 列表缩略图：按路径缓存，文件变了（mtime 不同）就重建。
+    pub fn thumb(&self, path: &Path, mtime: u64) -> Option<Arc<clipimg::Thumb>> {
+        {
+            let cache = self.thumbs.lock().unwrap();
+            if let Some((m, t)) = cache.get(path) {
+                if *m == mtime {
+                    return Some(Arc::new(clipimg::Thumb {
+                        hbmp: t.hbmp,
+                        dc: t.dc,
+                        w: t.w,
+                        h: t.h,
+                    }));
+                }
+            }
+        }
+        let thumb = unsafe { clipimg::make_thumb(path, 34) }?;
+        let mut cache = self.thumbs.lock().unwrap();
+        // 缓存别无限长：超过 120 张就整体丢掉重建（列表本身也只留 200 行）
+        if cache.len() > 120 {
+            for (_, (_, t)) in cache.drain() {
+                unsafe { t.destroy() };
+            }
+        }
+        let boxed = Arc::new(thumb);
+        cache.insert(
+            path.to_path_buf(),
+            (
+                mtime,
+                clipimg::Thumb {
+                    hbmp: boxed.hbmp,
+                    dc: boxed.dc,
+                    w: boxed.w,
+                    h: boxed.h,
+                },
+            ),
+        );
+        Some(boxed)
     }
 
     pub fn set_link(&self, info: LinkInfo) {
@@ -1002,6 +1082,7 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
             }
             let hot = hover == i as i32;
             let is_file = matches!(row.kind, RowKind::File { .. });
+            let is_image = matches!(row.kind, RowKind::Image { .. });
             // 方向配色和手机端一致：发=琥珀，收=青。静默走暗档、悬浮提亮，边框 1px。
             let edge = match (row.outgoing, hot) {
                 (true, true) => C_SEND,
@@ -1011,24 +1092,44 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
             };
             fill_round(hdc, r, if hot { C_ROW_HOVER } else { C_PANEL }, edge, 8);
 
-            // 类型图标：文本=复制小方块，文件=文档
-            let icon_x = r.left + 15;
-            let icon_y = r.top + (ROW_H - 15) / 2;
-            if is_file {
-                draw_doc(hdc, icon_x, icon_y, if hot { C_TEAL } else { C_DIM });
+            // 类型图标：文本=复制小方块，文件=文档，图片=缩略图
+            let mut text_left = r.left + 40;
+            if is_image {
+                let path = match &row.kind {
+                    RowKind::Image { path, .. } => path.clone(),
+                    _ => PathBuf::new(),
+                };
+                if let Some(thumb) = app.thumb(&path, row.mtime) {
+                    let box_ = RECT {
+                        left: r.left + 11,
+                        top: r.top + 6,
+                        right: r.left + 45,
+                        bottom: r.top + ROW_H - 6,
+                    };
+                    clipimg::draw_thumb(hdc, &thumb, box_);
+                } else {
+                    draw_doc(hdc, r.left + 15, r.top + (ROW_H - 15) / 2, C_DIM);
+                }
+                text_left = r.left + 54;
             } else {
-                draw_copy(hdc, icon_x, icon_y, if hot { C_TEAL } else { C_DIM });
+                let icon_x = r.left + 15;
+                let icon_y = r.top + (ROW_H - 15) / 2;
+                if is_file {
+                    draw_doc(hdc, icon_x, icon_y, if hot { C_TEAL } else { C_DIM });
+                } else {
+                    draw_copy(hdc, icon_x, icon_y, if hot { C_TEAL } else { C_DIM });
+                }
             }
 
-            // 文件行右侧留出「打开所在目录」图标的位置
+            // 文件/图片行右侧留出「打开所在目录」图标的位置
             let folder_x = r.right - 16 - 18;
-            let meta_right = if is_file { folder_x - 12 } else { r.right - 16 };
+            let meta_right = if is_file || is_image { folder_x - 12 } else { r.right - 16 };
 
             text_in(
                 hdc,
                 &row.title,
                 RECT {
-                    left: r.left + 40,
+                    left: text_left,
                     top: r.top + 6,
                     right: meta_right - 168,
                     bottom: r.bottom - 6,
@@ -1050,7 +1151,7 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
                 C_FAINT,
                 DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
             );
-            if is_file {
+            if is_file || is_image {
                 draw_folder(hdc, folder_x, r.top + (ROW_H - 15) / 2, if hot { C_AMBER } else { C_DIM });
             }
         }
@@ -1390,6 +1491,59 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
         }
     }
 
+    // 剪贴板图片：文件名 `out_<ms>_<w>x<h>.png` / `in_...`，方向和尺寸直接从名字读，
+    // 不必为了列一行去解码 PNG。
+    if let Ok(entries) = std::fs::read_dir(&app.images) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !name.ends_with(".png") {
+                continue;
+            }
+            let outgoing = name.starts_with("out");
+            let dims = name
+                .trim_end_matches(".png")
+                .rsplit('_')
+                .next()
+                .and_then(|d| d.split_once('x'))
+                .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let (w, h) = dims.unwrap_or((0, 0));
+            rows.push(Row {
+                kind: RowKind::Image { path: path.clone() },
+                mtime,
+                outgoing,
+                title: if w > 0 {
+                    format!("图片 {w}×{h}")
+                } else {
+                    "图片".to_string()
+                },
+                meta: format!(
+                    "{} · {} · {}",
+                    human_size(meta.len()),
+                    if outgoing {
+                        format!("发给 {peer}")
+                    } else {
+                        format!("来自 {peer}")
+                    },
+                    fmt_time(mtime)
+                ),
+            });
+        }
+    }
+
     rows.sort_by_key(|r| std::cmp::Reverse(r.mtime));
     rows.truncate(200);
     let mut cur = app.rows.lock().unwrap();
@@ -1448,6 +1602,16 @@ unsafe fn activate_row(app: &App, hwnd: HWND, pt: POINT) {
         let rows = app.rows.lock().unwrap();
         match rows.get(idx as usize).map(|r| &r.kind) {
             Some(RowKind::Text { text, .. }) => Some(Action::Copy(text.clone())),
+            Some(RowKind::Image { path, .. }) => {
+                let mut rc: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rc);
+                let r = row_rect(rc.right, idx as i32, app.scroll.load(Ordering::Relaxed) as i32);
+                if pt.x >= r.right - 44 {
+                    Some(Action::OpenDir(path.clone()))
+                } else {
+                    Some(Action::CopyImage(path.clone()))
+                }
+            }
             Some(RowKind::File { path, .. }) => {
                 let mut rc: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut rc);
@@ -1469,6 +1633,16 @@ unsafe fn activate_row(app: &App, hwnd: HWND, pt: POINT) {
                 app.set_hint("复制失败，剪贴板被占用");
             }
         }
+        Some(Action::CopyImage(p)) => match std::fs::read(&p).ok().and_then(|b| clipimg::decode_png(&b)) {
+            Some(bmp) => {
+                if clipimg::write_clipboard(&bmp) {
+                    app.set_hint(&format!("已复制图片 {}×{}", bmp.w, bmp.h));
+                } else {
+                    app.set_hint("复制失败，剪贴板被占用");
+                }
+            }
+            None => app.set_hint("这张图读不出来"),
+        },
         Some(Action::OpenDir(p)) => {
             let explorer = wide("explorer.exe");
             let args = format!("/select,\"{}\"", p.display());
@@ -1497,25 +1671,42 @@ unsafe fn activate_row(app: &App, hwnd: HWND, pt: POINT) {
 
 enum Action {
     Copy(String),
+    CopyImage(PathBuf),
     OpenDir(PathBuf),
     OpenFile(PathBuf),
 }
 
-/// 把剪贴板里的文本发出去（不做后台监听，只有用户明确粘贴才发）。
+/// 把剪贴板里的东西发出去（不做后台监听，只有用户明确粘贴才发）。
+/// 优先级：有文字发文字；没文字但剪贴板是张图，就转成 PNG 发图。
 unsafe fn send_clipboard(app: &App, hwnd: HWND) {
-    let Some(text) = read_clipboard_text() else {
-        app.set_hint("剪贴板里没有文本");
-        return;
-    };
-    if text.trim().is_empty() {
-        app.set_hint("剪贴板里没有文本");
-        return;
+    if let Some(text) = read_clipboard_text() {
+        if !text.trim().is_empty() {
+            let chars = text.chars().count();
+            if app.send_text(text) {
+                app.set_hint(&format!("已发送 {chars} 字到手机"));
+            } else {
+                app.set_hint("发送通道未就绪，稍后再试");
+            }
+            let _ = hwnd;
+            return;
+        }
     }
-    let chars = text.chars().count();
-    if app.send_text(text) {
-        app.set_hint(&format!("已发送 {chars} 字到手机"));
-    } else {
-        app.set_hint("发送通道未就绪，稍后再试");
+    match clipimg::read_clipboard() {
+        Some(bmp) => match clipimg::encode_png(&bmp) {
+            Some(png) => {
+                let (w, h) = (bmp.w, bmp.h);
+                // 协议单帧上限 16MB，留点余量：超了就让用户先缩一下，不要发出去才发现写帧失败
+                if png.len() > 12 * 1024 * 1024 {
+                    app.set_hint("图片太大（超过 12MB），先压缩再发");
+                } else if app.send_image(png, w, h) {
+                    app.set_hint(&format!("已发送图片 {w}×{h}"));
+                } else {
+                    app.set_hint("发送通道未就绪，稍后再试");
+                }
+            }
+            None => app.set_hint("这张图转 PNG 失败"),
+        },
+        None => app.set_hint("剪贴板里没有文字或图片"),
     }
     let _ = hwnd;
 }
