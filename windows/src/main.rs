@@ -465,6 +465,32 @@ fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOp
     Ok(())
 }
 
+/// 一条连接现在走的是哪条路径：优先看选中的那条，没有就用第一条。
+/// 直连是打洞成功后 iroh 新增并切过去的 IP 路径，中继是兜底。
+fn conn_path(conn: &Connection) -> (bool, u64) {
+    // 一条连接同时挂着中继和打洞出来的直连两条路，iroh 自己会在里面挑。
+    // 但 is_selected 在某些时刻会停在中继上（切换滞后），界面上就会把 4ms 的局域网显示成 300ms。
+    // 所以这里按「有效路径里最好的那条」算：有直连、且不比重继慢，就算直连。
+    let mut best: Option<(bool, u64)> = None;
+    for p in conn.paths().iter() {
+        let pair = (p.is_ip(), p.rtt().as_millis() as u64);
+        best = Some(match best {
+            None => pair,
+            Some(cur) => {
+                let better = match (cur.0, pair.0) {
+                    // 中继换直连：直连得明显更快才换，免得抖动时来回跳
+                    (false, true) => pair.1 + 20 <= cur.1,
+                    // 已经是直连就别退回中继
+                    (true, false) => false,
+                    _ => pair.1 < cur.1,
+                };
+                if better { pair } else { cur }
+            }
+        });
+    }
+    best.unwrap_or((false, 0))
+}
+
 /// 电脑的显示名：手机端节点卡上要能看到「已连接 <这个名字>」。
 /// 取 `COMPUTERNAME`（Windows 默认就是主机名），取不到退回通用名。
 fn pc_device_name() -> String {
@@ -523,39 +549,36 @@ async fn serve_net(
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tick.tick().await;
-                let conns: Vec<Connection> = peers.lock().await.values().cloned().collect();
+                let map = peers.lock().await;
                 let mut info = ui::LinkInfo::default();
-                if let Some(conn) = conns.iter().find(|c| c.close_reason().is_none()) {
+                let mut direct_n = 0usize;
+                let mut rtt_max = 0u64;
+                let mut slots = Vec::new();
+                for (id, conn) in map.iter() {
+                    if conn.close_reason().is_some() {
+                        continue;
+                    }
+                    let (direct, rtt_ms) = conn_path(conn);
                     info.connected = true;
-                    let paths = conn.paths();
-                    let mut selected = None;
-                    let mut any = None;
-                    for p in paths.iter() {
-                        let pair = (p.is_ip(), p.rtt().as_millis() as u64);
-                        if p.is_selected() {
-                            selected = Some(pair);
-                        }
-                        if any.is_none() {
-                            any = Some(pair);
-                        }
+                    if direct {
+                        direct_n += 1;
                     }
-                    if let Some((direct, rtt_ms)) = selected.or(any) {
-                        info.direct = direct;
-                        info.rtt_ms = rtt_ms;
-                    }
+                    rtt_max = rtt_max.max(rtt_ms);
+                    slots.push(ui::PeerSlot {
+                        id: id.to_string(),
+                        name: String::new(),
+                        direct,
+                        rtt_ms,
+                    });
                 }
+                drop(map);
+                info.peers = slots.len();
+                info.direct_n = direct_n;
+                info.direct = slots.len() == 1 && direct_n == 1;
+                info.rtt_ms = rtt_max;
                 app.set_link(info);
 
                 // 顺手把「连着的手机」同步给 UI：副标题、发送目标胶囊、行的「发给 xxx」都靠它
-                let slots = {
-                    let map = peers.lock().await;
-                    map.keys()
-                        .map(|id| ui::PeerSlot {
-                            id: id.to_string(),
-                            name: String::new(),
-                        })
-                        .collect::<Vec<_>>()
-                };
                 app.set_peers(slots);
             }
         });

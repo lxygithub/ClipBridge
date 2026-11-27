@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, RegisterHotKey, SetFocus, MOD_ALT, MOD_CONTROL, VK_A, VK_CONTROL, VK_DELETE,
-    VK_ESCAPE, VK_V,
+    VK_ESCAPE, VK_SHIFT, VK_V,
 };
 use windows_sys::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, Shell_NotifyIconW, ShellExecuteW, NIF_ICON,
@@ -148,9 +148,14 @@ pub struct HistoryItem {
 #[derive(Clone, Copy, Default)]
 pub struct LinkInfo {
     pub connected: bool,
-    /// true = 打洞成功走 IP 直连；false = 走 relay
+    /// 只有一台时才有意义：true = 打洞成功走 IP 直连；false = 走 relay
     pub direct: bool,
+    /// 单台是它自己的延迟；多台时取最慢的那台（徽标只报汇总，具体每台的延迟在「发给」胶囊上）
     pub rtt_ms: u64,
+    /// 在线设备台数
+    pub peers: usize,
+    /// 其中走直连的台数
+    pub direct_n: usize,
 }
 
 /// 列表里的一行：文本 / 文件 / 剪贴板图片。
@@ -178,6 +183,9 @@ pub struct Row {
 pub struct PeerSlot {
     pub id: String,
     pub name: String,
+    /// 这台现在走没走直连；胶囊上顺带把延迟写出来，多台时才知道「这个 586 ms 是谁的」
+    pub direct: bool,
+    pub rtt_ms: u64,
 }
 
 pub struct App {
@@ -191,8 +199,10 @@ pub struct App {
     peer_names: Mutex<std::collections::HashMap<String, String>>,
     /// 只发给这一台；None = 广播给全部
     target: Mutex<Option<String>>,
-    /// 列表里选中的行（存 Row::key）。Ctrl+点追加/取消，Delete 一次性删掉
+    /// 列表里选中的行（存 Row::key）。Ctrl+点追加/取消，Shift+点从锚点连选，Delete 一次性删掉
     selected: Mutex<std::collections::HashSet<String>>,
+    /// Shift 连选的起点（行号，-1 = 还没点过任何行）
+    anchor: AtomicIsize,
     /// 删掉的东西不直接抹掉，挪到这儿还能捞回来
     trash: PathBuf,
     inbox: PathBuf,
@@ -238,6 +248,7 @@ impl App {
             peer_names: Mutex::new(std::collections::HashMap::new()),
             target: Mutex::new(None),
             selected: Mutex::new(std::collections::HashSet::new()),
+            anchor: AtomicIsize::new(-1),
             trash: dir.join("trash"),
             inbox: dir.join("inbox"),
             outbox: dir.join("outbox"),
@@ -368,7 +379,13 @@ impl App {
         let changed = {
             let mut cur = self.peers.lock().unwrap();
             let same = cur.len() == list.len()
-                && cur.iter().zip(list.iter()).all(|(a, b)| a.id == b.id && a.name == b.name);
+                && cur.iter().zip(list.iter()).all(|(a, b)| {
+                    a.id == b.id
+                        && a.name == b.name
+                        && a.direct == b.direct
+                        // 延迟抖几个 ms 不值得整窗重绘，按 20ms 一档比
+                        && a.rtt_ms / 20 == b.rtt_ms / 20
+                });
             if same {
                 false
             } else {
@@ -523,8 +540,7 @@ impl App {
     }
 
     /// Ctrl+A：当前列表全选。
-    pub fn select_all_rows(&self) {
-        {
+    pub fn select_all_rows(&self) {        {
             let rows = self.rows.lock().unwrap();
             let mut set = self.selected.lock().unwrap();
             set.clear();
@@ -547,6 +563,36 @@ impl App {
             self.refresh();
         }
         had
+    }
+
+    /// Shift 连选的锚点：Ctrl+点 / 普通点都会把它挪到当前行。
+    pub fn set_anchor(&self, idx: isize) {
+        self.anchor.store(idx, Ordering::Relaxed);
+    }
+
+    pub fn anchor(&self) -> isize {
+        self.anchor.load(Ordering::Relaxed)
+    }
+
+    /// Shift+点：把锚点到这一行之间的所有条目选中（替换原有选中）。
+    pub fn select_range(&self, from: isize, to: isize) {
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        let keys: Vec<String> = {
+            let rows = self.rows.lock().unwrap();
+            rows.iter()
+                .enumerate()
+                .filter(|(i, _)| (*i as isize) >= lo && (*i as isize) <= hi)
+                .map(|(_, r)| r.key.clone())
+                .collect()
+        };
+        {
+            let mut set = self.selected.lock().unwrap();
+            set.clear();
+            for k in keys {
+                set.insert(k);
+            }
+        }
+        self.refresh();
     }
 
     /// 删除选中的条目，返回删掉的条数。
@@ -944,12 +990,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     (*app).set_page(next);
                 } else {
                     let idx = row_at(&*app, rc.right, pt);
+                    let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+                    let shift = GetKeyState(VK_SHIFT as i32) < 0;
                     if idx < 0 {
                         // 点空白：取消选中
                         if (*app).clear_selection() {
                             InvalidateRect(hwnd, ptr::null(), 0);
                         }
-                    } else if GetKeyState(VK_CONTROL as i32) < 0 {
+                    } else if shift && (*app).anchor() >= 0 {
+                        // Shift+点：从锚点连选到这一行（和资源管理器一致）
+                        (*app).select_range((*app).anchor(), idx);
+                        InvalidateRect(hwnd, ptr::null(), 0);
+                    } else if ctrl {
                         // Ctrl+点：加进选中 / 移出选中，不触发复制或打开
                         let key = {
                             let rows = (*app).rows.lock().unwrap();
@@ -957,10 +1009,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         };
                         if let Some(k) = key {
                             (*app).toggle_selected(&k);
+                            (*app).set_anchor(idx);
                             InvalidateRect(hwnd, ptr::null(), 0);
                         }
                     } else {
                         // 普通点：先清掉多选，再做原来的动作（复制 / 打开）
+                        (*app).set_anchor(idx);
                         (*app).clear_selection();
                         activate_row(&*app, hwnd, pt);
                     }
@@ -1071,12 +1125,18 @@ fn peer_chips(app: &App, width: i32) -> Vec<(Option<String>, String, RECT)> {
         x += w + 6;
     }
     for p in peers.iter() {
-        let label = if p.name.is_empty() {
+        let name = if p.name.is_empty() {
             format!("{}…", &p.id[..8.min(p.id.len())])
-        } else if p.name.chars().count() > 14 {
-            format!("{}…", p.name.chars().take(14).collect::<String>())
+        } else if p.name.chars().count() > 12 {
+            format!("{}…", p.name.chars().take(12).collect::<String>())
         } else {
             p.name.clone()
+        };
+        // 多台时 Capsule 上带自己的延迟，才分得清徽标里那个数字是谁的
+        let label = if p.rtt_ms > 0 {
+            format!("{name} · {}", fmt_rtt(p.rtt_ms))
+        } else {
+            name
         };
         let w = 16 + chip_text_w(&label);
         if x + w > width - 16 {
@@ -1343,10 +1403,20 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
 
-    // 状态徽标：直连/中继 + 延迟
+    // 状态徽标：单台报「直连/中继 + 延迟」；多台只报汇总（几台、各自走什么），
+    // 具体某台的延迟写在「发给」那一行的胶囊上，不然根本分不清这个数字是谁的。
     let link = *app.link.lock().unwrap();
     let (label, fg, bg) = if !link.connected {
         ("未连接".to_string(), 0x0087_9584u32, 0x001E_2C39u32)
+    } else if link.peers >= 2 {
+        let n = link.peers;
+        if link.direct_n == n {
+            (format!("{n} 台 · 直连"), 0x00A6_E37Bu32, 0x002B_4314u32)
+        } else if link.direct_n == 0 {
+            (format!("{n} 台 · 中继"), 0x00B3_A496u32, 0x0023_1B14u32)
+        } else {
+            (format!("{n} 台 · 混合"), 0x005B_B9F5u32, 0x0012_324Au32)
+        }
     } else if link.direct {
         let ms = link.rtt_ms;
         let (fg, bg) = if ms <= 60 {
