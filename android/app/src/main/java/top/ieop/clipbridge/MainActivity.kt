@@ -194,10 +194,9 @@ private fun ChannelScreen(
     val state by BridgeState.state.collectAsState()
     val items by BridgeState.items.collectAsState()
     val link by BridgeState.link.collectAsState()
-    val files by BridgeState.files.collectAsState()
     val peerName by BridgeState.peerName.collectAsState()
 
-    // 链路状态、对端名字和文件列表都来自 Rust 侧，2 秒拉一次（读 mutex/扫目录，开销可忽略）
+    // 链路状态和对端名字来自 Rust 侧，2 秒拉一次（读 mutex，开销可忽略）
     val prefs = remember { Prefs(ctx) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -207,8 +206,6 @@ private fun ChannelScreen(
                 BridgeState.peerName.value = name
                 // 连上以后把电脑名字记进配对表，设置页里就是「我的主机」而不是一串 hex
                 if (name.isNotBlank() && peerId.isNotBlank()) prefs.rememberPeer(peerId, name)
-                val raw = runCatching { Native.nativeListFiles() }.getOrDefault("[]")
-                BridgeState.files.value = parseFiles(raw)
                 // 状态是「已连接」，但 Rust 侧很久没确认过链路活着（或多进程已经换了会话）：
                 // 这就是「手机显示连着、电脑端早就没了」的那种假连接，直接翻成未连接。
                 val idle = runCatching { Native.nativeIdleMs() }.getOrDefault(-1L)
@@ -290,23 +287,6 @@ private fun ChannelScreen(
             link = link
         )
 
-        if (files.isNotEmpty()) {
-            Spacer(Modifier.height(12.dp))
-            FilesSection(
-                peerName = pcName,
-                files = files,
-                onShare = { shareFile(ctx, File(it.path)) },
-                onOpen = { f ->
-                    // 发出去的文件只留在电脑上，手机上点开没有意义
-                    if (f.outgoing || f.path.isBlank()) {
-                        toast(ctx, "这个文件已经在「$pcName」上")
-                    } else {
-                        openFile(ctx, File(f.path))
-                    }
-                }
-            )
-        }
-
         Spacer(Modifier.height(14.dp))
         Row {
             Text("时间 · 方向 · 内容", color = Palette.faint, fontSize = 9.sp, letterSpacing = 1.4.sp)
@@ -338,7 +318,22 @@ private fun ChannelScreen(
             } else {
                 LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                     items(items, key = { "${it.seq}-${it.ts}" }) { item ->
-                        TimelineRow(item, pcName) { selected = item }
+                        TimelineRow(
+                            item = item,
+                            peer = pcName,
+                            onClick = {
+                                val fp = item.filePath
+                                if (item.isFile) {
+                                    if (fp != null) openFile(ctx, File(fp))
+                                    else toast(ctx, "这个文件已经在「$pcName」上")
+                                } else {
+                                    selected = item
+                                }
+                            },
+                            onShare = if (item.isFile && item.filePath != null) {
+                                { shareFile(ctx, File(item.filePath)) }
+                            } else null
+                        )
                     }
                     item {
                         Text(
@@ -592,8 +587,14 @@ private fun PathChip(link: String) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun TimelineRow(item: ClipItem, peer: String, onClick: () -> Unit) {
+private fun TimelineRow(
+    item: ClipItem,
+    peer: String,
+    onClick: () -> Unit,
+    onShare: (() -> Unit)? = null
+) {
     val accent = if (item.outgoing) Palette.amber else Palette.teal
     Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
         Box(Modifier.width(30.dp).fillMaxHeight()) {
@@ -628,7 +629,10 @@ private fun TimelineRow(item: ClipItem, peer: String, onClick: () -> Unit) {
                     .fillMaxWidth()
                     .background(Palette.panel, RoundedCornerShape(3.dp))
                     .border(1.dp, Palette.border, RoundedCornerShape(3.dp))
-                    .clickable { onClick() }
+                    .combinedClickable(
+                        onClick = { onClick() },
+                        onLongClick = { onShare?.invoke() }
+                    )
                     .height(IntrinsicSize.Min)
             ) {
                 Box(Modifier.width(2.dp).fillMaxHeight().background(accent))
@@ -661,8 +665,11 @@ private fun TimelineRow(item: ClipItem, peer: String, onClick: () -> Unit) {
                     Spacer(Modifier.height(6.dp))
                     Text(
                         when {
+                            item.isFile && item.filePath != null ->
+                                "文件 · " + humanSize(item.fileSize) + " · 点击打开"
+                            item.isFile -> "文件 · 已在电脑上"
+                            item.imagePath != null -> "图片 · ${item.imageW}×${item.imageH}"
                             item.seq > 0 -> "#${item.seq} · ${item.text.length} 字"
-                            item.text.contains('·') && (item.text.startsWith("文件") || item.text.startsWith("已发送") || item.text.startsWith("发送失败")) -> "文件"
                             else -> "已送达 · ${item.text.length} 字"
                         },
                         color = Palette.faint,
@@ -810,93 +817,6 @@ private fun DetailAction(label: String, onClick: () -> Unit) {
     }
 }
 
-/// 文件区：收（inbox 里落地的）和发（发出去的流水）都列，行里标「发往 xxx / 来自 xxx」。
-/// 收到的：点一下用系统播放器打开，长按分享；发出去的文件本体在电脑上，点了只提示位置。
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun FilesSection(
-    peerName: String,
-    files: List<RecvFile>,
-    onShare: (RecvFile) -> Unit,
-    onOpen: (RecvFile) -> Unit
-) {
-    Column {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "文件 · ${files.size}",
-                color = Palette.faint,
-                fontSize = 9.sp,
-                letterSpacing = 1.4.sp
-            )
-            Spacer(Modifier.weight(1f))
-            Text(
-                "收 ${files.count { !it.outgoing }} · 发 ${files.count { it.outgoing }}",
-                color = Palette.faint,
-                fontSize = 9.sp
-            )
-        }
-        Spacer(Modifier.height(4.dp))
-        files.take(6).forEach { f ->
-            val accent = if (f.outgoing) Palette.amber else Palette.teal
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 3.dp)
-                    .background(Palette.panel, RoundedCornerShape(3.dp))
-                    .border(1.dp, Palette.border, RoundedCornerShape(3.dp))
-                    .combinedClickable(
-                        onClick = { onOpen(f) },
-                        onLongClick = { if (!f.outgoing && f.path.isNotBlank()) onShare(f) }
-                    )
-                    .height(IntrinsicSize.Min)
-            ) {
-                // 方向色条：和文本条目同一套语义（发=琥珀、收=青）
-                Box(Modifier.width(2.dp).fillMaxHeight().background(accent))
-                Column(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
-                    Text(
-                        f.name,
-                        color = Palette.ink,
-                        fontSize = 12.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(Modifier.height(3.dp))
-                    Text(
-                        // 「发往 / 来自」带上设备名，才知道这份文件归谁
-                        (if (f.outgoing) "发往 $peerName" else "来自 $peerName") +
-                            " · " + humanSize(f.size),
-                        color = Palette.faint,
-                        fontSize = 9.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-        }
-        if (files.size > 6) {
-            Text(
-                "还有 ${files.size - 6} 个文件",
-                color = Palette.faint,
-                fontSize = 9.sp,
-                modifier = Modifier.padding(top = 4.dp, start = 2.dp)
-            )
-        }
-    }
-}
-
-private fun parseFiles(raw: String): List<RecvFile> = runCatching {
-    val arr = org.json.JSONArray(raw)
-    (0 until arr.length()).map { i ->
-        val o = arr.getJSONObject(i)
-        RecvFile(
-            name = o.optString("name"),
-            size = o.optLong("size"),
-            path = o.optString("path"),
-            mtime = o.optLong("mtime"),
-            outgoing = o.optBoolean("outgoing", false)
-        )
-    }
-}.getOrDefault(emptyList())
 
 private fun humanSize(n: Long): String = when {
     n < 1024 -> "$n B"

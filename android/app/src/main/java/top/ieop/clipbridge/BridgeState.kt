@@ -15,17 +15,12 @@ data class ClipItem(
     /** 图片条目：本地 PNG 路径；文本条目为 null */
     val imagePath: String? = null,
     val imageW: Int = 0,
-    val imageH: Int = 0
-)
-
-/** 跨界面共享的连接状态（Rust 回调线程写，UI 读）。 */
-/** 手机上的一个文件条目：收（inbox 落地）或发（只是流水，文件本体在电脑上）。 */
-data class RecvFile(
-    val name: String,
-    val size: Long,
-    val path: String,
-    val mtime: Long,
-    val outgoing: Boolean = false
+    val imageH: Int = 0,
+    /** 文件条目：收下来的本地路径；发出去的文件本体在电脑上，为 null */
+    val filePath: String? = null,
+    val fileSize: Long = 0L,
+    /** 这条是文件（不是文本/图片）；发出去的文件没有本地路径，靠它区分 */
+    val isFile: Boolean = false
 )
 
 object BridgeState {
@@ -40,9 +35,6 @@ object BridgeState {
 
     /** 链路：`direct|12` / `relay|312` / 空串，Rust 侧每 2 秒刷新一次 */
     val link = MutableStateFlow("")
-
-    /** 收到的文件列表 */
-    val files = MutableStateFlow<List<RecvFile>>(emptyList())
 
     /** 电脑的显示名（来自电脑的 HELLO），列表里「发往 xxx / 来自 xxx」用它 */
     val peerName = MutableStateFlow("")
@@ -68,6 +60,8 @@ object BridgeState {
                 val path = o.optString("imagePath").ifBlank { null }
                 // 图片被清掉了就只留文字记录，不要把空路径塞回列表
                 if (path != null && !File(path).exists()) continue
+                val fpath = o.optString("filePath").ifBlank { null }
+                // 收到的文件被删了也保留一条记录，只是点不开
                 list += ClipItem(
                     seq = o.optLong("seq", 0),
                     text = o.optString("text"),
@@ -75,7 +69,10 @@ object BridgeState {
                     outgoing = o.optBoolean("outgoing", false),
                     imagePath = path,
                     imageW = o.optInt("imageW", 0),
-                    imageH = o.optInt("imageH", 0)
+                    imageH = o.optInt("imageH", 0),
+                    filePath = fpath?.takeIf { File(it).exists() },
+                    fileSize = o.optLong("fileSize", 0),
+                    isFile = o.optBoolean("isFile", false)
                 )
             }
             items.value = list.take(200)
@@ -97,6 +94,9 @@ object BridgeState {
                         put("imageW", it.imageW)
                         put("imageH", it.imageH)
                     }
+                    it.filePath?.let { p -> put("filePath", p) }
+                    if (it.isFile) put("isFile", true)
+                    if (it.fileSize > 0) put("fileSize", it.fileSize)
                 })
             }
             f.writeText(arr.toString())
@@ -147,6 +147,21 @@ object BridgeState {
                 imagePath = path,
                 imageW = w,
                 imageH = h
+            )
+        )
+    }
+
+    /** 文件条目：和图片一样进同一条时间线，不再单开「文件」列表。 */
+    fun pushFile(name: String, size: Long, path: String?, outgoing: Boolean) {
+        push(
+            ClipItem(
+                seq = 0,
+                text = name,
+                outgoing = outgoing,
+                filePath = path,
+                fileSize = size,
+                isFile = true,
+                ts = System.currentTimeMillis()
             )
         )
     }

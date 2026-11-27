@@ -145,9 +145,8 @@ class SyncService : Service(), BridgeListener {
     }
 
     override fun onFile(name: String, path: String, size: Long) {
-        BridgeState.push(
-            ClipItem(seq = 0, text = "文件 · $name", ts = System.currentTimeMillis())
-        )
+        // 文件不再是独立列表，直接作为一条普通时间线条目（点开就能看）
+        BridgeState.pushFile(name = name, size = size, path = path, outgoing = false)
         Notifier.showFile(this, name, size)
     }
 
@@ -181,14 +180,14 @@ class SyncService : Service(), BridgeListener {
     }
 
     override fun onFileSent(name: String, ok: Boolean) {
-        BridgeState.push(
-            ClipItem(
-                seq = 0,
-                text = if (ok) "已发送 · $name" else "发送失败 · $name",
-                ts = System.currentTimeMillis(),
-                outgoing = true
+        if (ok) {
+            // 文件本体在电脑上，条目里只留流水，点开提示位置
+            BridgeState.pushFile(name = name, size = 0, path = null, outgoing = true)
+        } else {
+            BridgeState.push(
+                ClipItem(seq = 0, text = "发送失败 · $name", outgoing = true)
             )
-        )
+        }
         Notifier.showFileSent(this, name, ok)
     }
 
