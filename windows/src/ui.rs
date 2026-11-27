@@ -78,8 +78,11 @@ const C_ROW_HOVER: u32 = 0x00281D12; // #121D28
 // 列表行按方向上色，口径与手机端时间线完全一致：
 //   发 = 琥珀 #F5B95B，收 = 青 #7BD3C0
 // 之前用「蓝 vs 青」，两个色相太近，扫一眼分不出来；手机端用的就是琥珀/青，蓝色不再参与方向语义。
+// 静默时走 *_DIM（暗一档，1px 边框不刺眼），悬浮时才提亮到满色。
 const C_SEND: u32 = 0x005B_B9F5; // #F5B95B 琥珀
+const C_SEND_DIM: u32 = 0x0033_668A; // #8A6633 暗琥珀
 const C_RECV: u32 = 0x00C0_D37B; // #7BD3C0 青
+const C_RECV_DIM: u32 = 0x006B_7644; // #44766B 暗青
 
 /// 窗口与控件共用的画刷/字体（进程生命周期内复用）。
 static BG_BRUSH: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
@@ -999,10 +1002,14 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
             }
             let hot = hover == i as i32;
             let is_file = matches!(row.kind, RowKind::File { .. });
-            // 方向配色和手机端一致：发=琥珀，收=青。悬浮只换底色，边框始终是方向色，
-            // 边框用 2px——1px 在深底上太细，两个色相再对也看不出来。
-            let edge = if row.outgoing { C_SEND } else { C_RECV };
-            fill_round_bw(hdc, r, if hot { C_ROW_HOVER } else { C_PANEL }, edge, 8, 2);
+            // 方向配色和手机端一致：发=琥珀，收=青。静默走暗档、悬浮提亮，边框 1px。
+            let edge = match (row.outgoing, hot) {
+                (true, true) => C_SEND,
+                (true, false) => C_SEND_DIM,
+                (false, true) => C_RECV,
+                (false, false) => C_RECV_DIM,
+            };
+            fill_round(hdc, r, if hot { C_ROW_HOVER } else { C_PANEL }, edge, 8);
 
             // 类型图标：文本=复制小方块，文件=文档
             let icon_x = r.left + 15;
@@ -1164,14 +1171,8 @@ fn fmt_rtt(ms: u64) -> String {
 // ---------- GDI 自绘小工具 ----------
 
 unsafe fn fill_round(hdc: HDC, rc: RECT, fill: u32, edge: u32, radius: i32) {
-    fill_round_bw(hdc, rc, fill, edge, radius, 1);
-}
-
-/// 同 [fill_round]，但边框线宽可调。列表行的方向边框用 2px：
-/// 1px 在深色底上太细，颜色再对也不容易一眼分辨。
-unsafe fn fill_round_bw(hdc: HDC, rc: RECT, fill: u32, edge: u32, radius: i32, bw: i32) {
     let brush = CreateSolidBrush(fill);
-    let pen = CreatePen(PS_SOLID, bw, edge);
+    let pen = CreatePen(PS_SOLID, 1, edge);
     let ob = SelectObject(hdc, brush as _);
     let op = SelectObject(hdc, pen as _);
     RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
