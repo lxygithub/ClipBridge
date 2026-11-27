@@ -109,9 +109,13 @@ pub async fn build_endpoint_opts(secret: SecretKey, opts: &NetOptions) -> Result
         .portmapper_config(iroh::endpoint::PortmapperConfig::default());
 
     if opts.port != 0 || opts.bind_ip.is_some() {
-        let ip = opts
-            .bind_ip
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        // 默认双栈：绑 `[::]` 才能同时开 v4/v6 两个 socket。
+        // 以前写的是 `0.0.0.0`，iroh 只建一个 v4 socket，`net_report` 于是报
+        // `udp_v6=false`、发布地址里一条 v6 都没有 —— 手机有公网 v6 也没法直连，
+        // 只能一路 relay。只有显式 `--bind-ip` 指定了具体网卡时才退成单栈。
+        let ip = opts.bind_ip.unwrap_or(std::net::IpAddr::V6(
+            std::net::Ipv6Addr::UNSPECIFIED,
+        ));
         builder = builder
             .bind_addr(std::net::SocketAddr::new(ip, opts.port))
             .context("invalid bind address")?;
@@ -120,8 +124,11 @@ pub async fn build_endpoint_opts(secret: SecretKey, opts: &NetOptions) -> Result
     if opts.relay.is_empty() {
         builder = builder.relay_mode(RelayMode::Default);
     } else {
+        // 钉单节点：两端 home relay 一致，打洞的引荐请求走同一条中继，
+        // 不会出现「我发 euc1、你发 usw1」这种跨区绕路。
         let url = RelayUrl::from_str(&opts.relay).context("invalid relay url")?;
-        builder = builder.relay_mode(RelayMode::custom([url]));
+        let map = iroh::RelayMap::from_iter([iroh::RelayConfig::from(url)]);
+        builder = builder.relay_mode(RelayMode::Custom(map));
     }
 
     let ep = builder.bind().await.context("bind endpoint")?;

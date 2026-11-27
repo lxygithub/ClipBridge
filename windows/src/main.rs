@@ -524,25 +524,61 @@ async fn serve_net(
             let id = conn.remote_id();
             println!("[conn] accepted {} ({id})", id.fmt_short());
             peers.lock().await.insert(id, conn.clone());
-            // 对端「发布了哪些候选地址」是判断它那边 QAD 成功没有的直接证据：
-            // 只有 relay 一条 = 它没测到自己公网映射，打洞不可能成
+            // 对端「发布了哪些候选地址」+ 当前实际路径，是判断它那边 QAD 成功没有的直接证据：
+            // 只有 relay 一条 = 它没测到自己公网映射，打洞不可能成。
+            // 打洞要 1–4 秒，建连瞬间的快照只有 relay；所以打两次，
+            // 免得日志把「还没打通」误读成「对端一条 IP 都没发布」。
             let ep2 = ep_for_peer.clone();
+            let probe = conn.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(6)).await;
-                if let Some(info) = ep2.remote_info(id).await {
-                    let addrs: Vec<String> = info
-                        .addrs()
-                        .map(|a| {
-                            let used = match a.usage() {
-                                iroh::endpoint::TransportAddrUsage::Active => "*",
-                                _ => "",
-                            };
-                            format!("{used}{:?}", a.addr())
-                        })
-                        .collect();
-                    println!("[peer] {} 候选地址: {}", id.fmt_short(), addrs.join(", "));
-                } else {
-                    println!("[peer] {} 还没拿到候选地址", id.fmt_short());
+                for (label, wait) in [("+2s", 2u64), ("+8s", 8u64)] {
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    if probe.close_reason().is_some() {
+                        break;
+                    }
+                    match ep2.remote_info(id).await {
+                        Some(info) => {
+                            let addrs: Vec<String> = info
+                                .addrs()
+                                .map(|a| {
+                                    let used = match a.usage() {
+                                        iroh::endpoint::TransportAddrUsage::Active => "*",
+                                        _ => "",
+                                    };
+                                    format!("{used}{:?}", a.addr())
+                                })
+                                .collect();
+                            println!(
+                                "[peer{label}] {} 候选地址: {}",
+                                id.fmt_short(),
+                                addrs.join(", ")
+                            );
+                        }
+                        None => println!("[peer{label}] {} 还没拿到候选地址", id.fmt_short()),
+                    }
+                    let paths = probe.paths();
+                    let mut shown: Vec<String> = Vec::new();
+                    for p in paths.iter() {
+                        let kind = match p.remote_addr() {
+                            TransportAddr::Relay(url) => format!("relay({url})"),
+                            TransportAddr::Ip(addr) => format!("direct({addr})"),
+                            other => format!("{other:?}"),
+                        };
+                        shown.push(format!(
+                            "{}{} rtt={}ms",
+                            if p.is_selected() { "*" } else { "" },
+                            kind,
+                            p.stats().rtt.as_millis()
+                        ));
+                    }
+                    println!(
+                        "[path{label}] {}",
+                        if shown.is_empty() {
+                            "(空)".to_string()
+                        } else {
+                            shown.join(" | ")
+                        }
+                    );
                 }
             });
             if let Err(err) = handle_conn(conn, store, pending, outgoing, completions, inbox).await {

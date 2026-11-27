@@ -74,7 +74,12 @@ const C_BORDER: u32 = 0x0032_2318; // #182332
 // 两块热区各自的底色，靠色相区分，不再用一条分隔线硬切
 const C_ZONE_TEXT_BG: u32 = 0x001C1E0E; // #0E1E1C 偏青
 const C_ROW_HOVER: u32 = 0x00281D12; // #121D28
-const C_ROW_EDGE: u32 = 0x001C2A36; // #362A1C
+
+// 列表行按方向上色：发送 = 品牌蓝，接收 = 青（和手机端 launcher / 通道色一致）
+const C_SEND: u32 = 0x00FF_6B2F; // #2F6BFF
+const C_SEND_DIM: u32 = 0x0099_4018; // 暗一档的蓝，未悬浮时用
+const C_RECV: u32 = 0x00C0_D37B; // #7BD3C0
+const C_RECV_DIM: u32 = 0x0063_6E3A; // 暗一档的青，未悬浮时用
 
 /// 窗口与控件共用的画刷/字体（进程生命周期内复用）。
 static BG_BRUSH: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
@@ -142,12 +147,14 @@ pub struct LinkInfo {
 /// 列表里的一行：要么是一条文本，要么是一个文件。
 pub enum RowKind {
     Text { text: String },
-    File { path: PathBuf, outgoing: bool },
+    File { path: PathBuf },
 }
 
 pub struct Row {
     pub kind: RowKind,
     pub mtime: u64,
+    /// true = 电脑发出去的，false = 手机发过来的；决定行边框配色
+    pub outgoing: bool,
     /// 预渲染的一行主文案
     pub title: String,
     /// 右侧元信息（大小 / 时间）
@@ -940,13 +947,15 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
             }
             let hot = hover == i as i32;
             let is_file = matches!(row.kind, RowKind::File { .. });
-            fill_round(
-                hdc,
-                r,
-                if hot { C_ROW_HOVER } else { C_PANEL },
-                if hot { C_ROW_EDGE } else { 0x0021_2B34 }, // #342B21 更淡的边
-                8,
-            );
+            // 方向配色：发送=品牌蓝，接收=青。悬浮时边框提亮，但色相不变，
+            // 扫一眼就知道哪几行是电脑发出去的、哪几行是手机发过来的。
+            let edge = match (row.outgoing, hot) {
+                (true, true) => C_SEND,
+                (true, false) => C_SEND_DIM,
+                (false, true) => C_RECV,
+                (false, false) => C_RECV_DIM,
+            };
+            fill_round(hdc, r, if hot { C_ROW_HOVER } else { C_PANEL }, edge, 8);
 
             // 类型图标：文本=复制小方块，文件=文档
             let icon_x = r.left + 15;
@@ -1268,8 +1277,10 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                 text: it.text.clone(),
             },
             mtime: it.mtime,
+            // store 里的文本都是电脑发出去的（手机发来的只写剪贴板、不入队）
+            outgoing: true,
             title: head.trim().replace('\t', " "),
-            meta: fmt_time(it.mtime),
+            meta: format!("已发 · {}", fmt_time(it.mtime)),
         });
     }
 
@@ -1299,11 +1310,9 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 rows.push(Row {
-                    kind: RowKind::File {
-                        path: path.clone(),
-                        outgoing,
-                    },
+                    kind: RowKind::File { path: path.clone() },
                     mtime,
+                    outgoing,
                     title: name,
                     meta: format!(
                         "{} · {}",
