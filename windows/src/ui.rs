@@ -57,7 +57,7 @@ const CLASS_NAME: &str = "ClipBridgeWnd";
 const TRAY_UID: u32 = 1;
 const HOTKEY_ID: i32 = 1;
 
-// 版面：标题 0..56，两块热区 62..148，发送目标行 152..178，列表标题 200..222，条目从这里开始
+// 版面：标题 0..56，两块热区 78..150，发送目标行 152..176，列表标题 200..222，条目从这里开始
 const LIST_TOP: i32 = 230;
 const PEER_TOP: i32 = 152;
 const PEER_H: i32 = 24;
@@ -199,6 +199,11 @@ pub struct App {
     peer_names: Mutex<std::collections::HashMap<String, String>>,
     /// 只发给这一台；None = 广播给全部
     target: Mutex<Option<String>>,
+    /// 每条条目发出去那一刻到底给了谁（Row::key → 标签）。写死在这里，
+    /// 之后再点「发给」行也**不会**改写历史条目的副标题。
+    delivered: Mutex<std::collections::HashMap<String, String>>,
+    /// 上面那份投递记录落盘的位置，重启后历史条目还认得自己当初发给谁
+    delivered_path: PathBuf,
     /// 列表里选中的行（存 Row::key）。Ctrl+点追加/取消，Shift+点从锚点连选，Delete 一次性删掉
     selected: Mutex<std::collections::HashSet<String>>,
     /// Shift 连选的起点（行号，-1 = 还没点过任何行）
@@ -247,6 +252,8 @@ impl App {
             peers: Mutex::new(Vec::new()),
             peer_names: Mutex::new(std::collections::HashMap::new()),
             target: Mutex::new(None),
+            delivered: Mutex::new(load_delivered(&dir.join("delivered.tsv"))),
+            delivered_path: dir.join("delivered.tsv"),
             selected: Mutex::new(std::collections::HashSet::new()),
             anchor: AtomicIsize::new(-1),
             trash: dir.join("trash"),
@@ -280,7 +287,13 @@ impl App {
 
     /// 发一张已编码好的 PNG。图片不写 store（文本库只存字），只在 images 目录留一份可回看。
     pub fn send_image(&self, png: Vec<u8>, w: u32, h: u32) -> bool {
-        self.save_image(&png, w, h, true);
+        if let Some(path) = self.save_image(&png, w, h, true) {
+            // 图片按文件名记投递对象（路径会随归档搬家，名字不会）
+            if let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string()) {
+                let label = self.current_target_label();
+                self.note_delivered(&format!("fname:{name}"), &label);
+            }
+        }
         match self.sender.lock().unwrap().as_ref() {
             Some(tx) => tx.send(Outgoing::Image(png)).is_ok(),
             None => false,
@@ -437,11 +450,36 @@ impl App {
         }
         *t = id;
         drop(t);
-        // 行的「发给 xxx」跟着变
+        // 只重绘「发给」那一行和标题，历史条目的副标题是发出去那一刻定下的，不受影响
         let hwnd = self.hist_hwnd.load(Ordering::Relaxed);
         if hwnd != 0 {
             unsafe { PostMessageW(hwnd as HWND, WM_APP_REFRESH, 0, 0) };
         }
+    }
+
+    /// 记下某条条目真正发给了谁（网络线程在投递前调用）。写一次就不再改动。
+    pub fn note_delivered(&self, key: &str, label: &str) {
+        let mut map = self.delivered.lock().unwrap();
+        if map.get(key).map(|s| s.as_str()) == Some(label) {
+            return;
+        }
+        map.insert(key.to_string(), label.to_string());
+        save_delivered(&self.delivered_path, &map);
+        drop(map);
+        let hwnd = self.hist_hwnd.load(Ordering::Relaxed);
+        if hwnd != 0 {
+            unsafe { PostMessageW(hwnd as HWND, WM_APP_REFRESH, 0, 0) };
+        }
+    }
+
+    /// 这条条目当初发给了谁；没记录（老数据 / 没连上）就返回 None。
+    pub fn delivered_of(&self, key: &str) -> Option<String> {
+        self.delivered.lock().unwrap().get(key).cloned()
+    }
+
+    /// 当前选择下「发给谁」的文字，网络线程发送前拿它写进投递记录。
+    pub fn current_target_label(&self) -> String {
+        self.peer_label()
     }
 
     /// 列表行与副标题用的对端标签：选了单台就是它的名字，否则「全部设备」。
@@ -1195,7 +1233,7 @@ fn peer_chip_at(app: &App, width: i32, pt: POINT) -> Option<Option<String>> {
 fn zone_rects(width: i32) -> (RECT, RECT, RECT) {
     let pad = 16;
     let top = 78;
-    let h = 82;
+    let h = 68;
     let card = RECT {
         left: pad,
         top,
@@ -1548,14 +1586,15 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
             hdc,
             &hint,
             RECT {
-                left: 18,
-                top: PEER_TOP + PEER_H + 2,
+                // 提示跟胶囊同一行、贴右边：不再单占一行，免得和「全部条目」标题挤在一起
+                left: w / 2 + 100,
+                top: PEER_TOP,
                 right: w - 16,
-                bottom: PEER_TOP + PEER_H + 16,
+                bottom: PEER_TOP + PEER_H,
             },
             small_font(),
             C_FAINT,
-            DT_SINGLELINE | DT_END_ELLIPSIS,
+            DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS,
         );
     }
 
@@ -1835,7 +1874,7 @@ unsafe fn paint_half(
             left: ix + 32,
             top: rc.top + 44,
             right: rc.right - 12,
-            bottom: rc.top + 68,
+            bottom: rc.top + 65,
         },
         small_font(),
         if hot { accent } else { C_FAINT },
@@ -1843,6 +1882,37 @@ unsafe fn paint_half(
     );
 }
 
+
+/// 投递记录落盘：每行 `Row::key<TAB>标签`。只是给历史条目留个「当初发给了谁」。
+fn save_delivered(path: &Path, map: &std::collections::HashMap<String, String>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut out = String::new();
+    for (k, v) in map {
+        out.push_str(k);
+        out.push('\t');
+        out.push_str(&v.replace('\t', " "));
+        out.push('\n');
+    }
+    let _ = std::fs::write(path, out);
+}
+
+fn load_delivered(path: &Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    for line in text.lines() {
+        let mut it = line.splitn(2, '\t');
+        if let (Some(k), Some(v)) = (it.next(), it.next()) {
+            if !k.is_empty() && !v.is_empty() {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    map
+}
 
 fn fmt_rtt(ms: u64) -> String {
     if ms >= 1000 {
@@ -1999,7 +2069,6 @@ unsafe fn draw_folder_big(hdc: HDC, x: i32, y: i32, color: u32) {
 /// 列表数据：条目页 = 文本 + 文件；日志页 = 只有文本。返回是否有变化。
 unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
     let log_page = app.page() == 1;
-    let peer = app.peer_label();
     let peer_in = app.peer_label_in();
     let mut rows: Vec<Row> = Vec::new();
 
@@ -2012,8 +2081,14 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
             .chars()
             .take(120)
             .collect();
+        let key = format!("t{}", it.seq);
+        // 历史条目写「当初发给了谁」，不再跟着当前选择漂移；老数据没记录就只说已发送
+        let sent = match app.delivered_of(&key) {
+            Some(w) => format!("发给 {w}"),
+            None => "已发送".to_string(),
+        };
         rows.push(Row {
-            key: format!("t{}", it.seq),
+            key,
             kind: RowKind::Text {
                 seq: it.seq,
                 text: it.text.clone(),
@@ -2022,7 +2097,7 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
             // store 里的文本都是电脑发出去的（手机发来的只写剪贴板、不入队）
             outgoing: true,
             title: head.trim().replace('\t', " "),
-            meta: format!("发给 {peer} · {}", fmt_time(it.mtime)),
+            meta: format!("{sent} · {}", fmt_time(it.mtime)),
         });
     }
 
@@ -2058,8 +2133,12 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
+                let key = format!("f{}", path.display());
+                let who = app
+                    .delivered_of(&format!("fname:{name}"))
+                    .or_else(|| app.delivered_of(&key));
                 rows.push(Row {
-                    key: format!("f{}", path.display()),
+                    key,
                     kind: RowKind::File { path: path.clone() },
                     mtime,
                     outgoing,
@@ -2068,7 +2147,10 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                         "{} · {}",
                         human_size(meta.len()),
                         if outgoing {
-                            format!("发给 {peer}")
+                            match who {
+                                Some(w) => format!("发给 {w}"),
+                                None => "已发送".to_string(),
+                            }
                         } else {
                             format!("来自 {peer_in}")
                         }
@@ -2108,8 +2190,12 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let (w, h) = dims.unwrap_or((0, 0));
+            let key = format!("i{}", path.display());
+            let who = app
+                .delivered_of(&format!("fname:{name}"))
+                .or_else(|| app.delivered_of(&key));
             rows.push(Row {
-                key: format!("i{}", path.display()),
+                key,
                 kind: RowKind::Image { path: path.clone() },
                 mtime,
                 outgoing,
@@ -2122,7 +2208,10 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                     "{} · {} · {}",
                     human_size(meta.len()),
                     if outgoing {
-                        format!("发给 {peer}")
+                        match who {
+                            Some(w) => format!("发给 {w}"),
+                            None => "已发送".to_string(),
+                        }
                     } else {
                         format!("来自 {peer_in}")
                     },

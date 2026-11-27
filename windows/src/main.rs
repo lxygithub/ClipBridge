@@ -623,6 +623,11 @@ async fn serve_net(
                     println!("[clip] no peer online, queued");
                     continue;
                 }
+                // 记下这条到底给了谁：之后在「发给」行换目标，历史条目也不再跟着变
+                if text.is_some() {
+                    let label = app.current_target_label();
+                    app.note_delivered(&format!("t{seq}"), &label);
+                }
                 for conn in conns {
                     let text = text.clone();
                     let image = image.clone();
@@ -1382,6 +1387,11 @@ async fn watch_outbox(
                 continue;
             }
             let mut all_ok = true;
+            // 记下这份文件发给了谁（按文件名记，之后挪到 sent/ 名字不变）
+            if let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string()) {
+                let label = app.current_target_label();
+                app.note_delivered(&format!("fname:{name}"), &label);
+            }
             for conn in conns {
                 if let Err(err) = push_file(&conn, &path, &outgoing, &completions).await {
                     let text = format!("{err:#}");
