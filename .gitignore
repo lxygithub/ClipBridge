@@ -12,3 +12,5 @@
 /android/app/src/main/jniLibs/
 # 本机配置
 /android/gradle/gradle-daemon-jvm.properties
+
+dist/*.tmp
