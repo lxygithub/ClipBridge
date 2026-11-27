@@ -1,0 +1,103 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'dist/**'
+      - 'docs/**'
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: windows exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+      - name: cargo build
+        run: cargo build --release -p clipbridge
+      - name: collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item target\release\clipbridge.exe out\clipbridge.exe
+          (Get-Item out\clipbridge.exe).Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipbridge-windows-x64
+          path: out/clipbridge.exe
+          if-no-files-found: error
+
+  android:
+    name: android apk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-release
+      - name: setup android sdk/ndk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> $GITHUB_ENV
+      - name: cargo-ndk
+        run: |
+          if ! command -v cargo-ndk >/dev/null; then cargo install cargo-ndk --locked; fi
+      - name: build native lib
+        run: |
+          cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p clipbridge-android --release
+          ls -l android/app/src/main/jniLibs/arm64-v8a
+      - name: assemble apk
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --console=plain
+      - name: collect
+        run: |
+          mkdir -p out && cp android/app/build/outputs/apk/debug/app-debug.apk out/clipbridge.apk
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipbridge-android-apk
+          path: out/clipbridge.apk
+          if-no-files-found: error
+
+  release:
+    name: publish latest
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: gather
+        run: |
+          mkdir -p out
+          cp artifacts/clipbridge-windows-x64/clipbridge.exe out/clipbridge.exe
+          cp artifacts/clipbridge-android-apk/clipbridge.apk out/clipbridge.apk
+          ls -l out
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest build
+          body: "自动构建：${{ github.sha }}"
+          files: |
+            out/clipbridge.exe
+            out/clipbridge.apk
+          make_latest: true
