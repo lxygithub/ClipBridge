@@ -16,6 +16,15 @@ serde.workspace = true
 serde_json.workspace = true
 clipbridge-core = { path = "../core" }
 png.workspace = true
+# 剪贴板里除了 PNG，还可能是 JFIF/JPEG、GIF、WEBP、BMP 的裸字节；统一用 image 解成 RGBA。
+# 只开解码需要的几个 feature，不带 rayon/avif 这类重依赖。
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+] }
 # 只在设了 RUST_LOG 时初始化，用来看 iroh 内部为什么打不通（QAD/打洞失败的具体原因）
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows-sys = { version = "0.61", features = [

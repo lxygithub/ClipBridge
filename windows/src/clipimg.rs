@@ -36,12 +36,37 @@ pub unsafe fn read_clipboard() -> Option<Bitmap> {
     if OpenClipboard(std::ptr::null_mut()) == 0 {
         return None;
     }
-    let out = read_png()
-        .or_else(|| read_dib(CF_DIB as u32))
-        .or_else(|| read_dib(CF_DIBV5 as u32))
-        .or_else(|| read_bitmap());
+    let out = read_registered(&[
+        "PNG",
+        "JFIF",
+        "JPEG",
+        "GIF",
+        "WEBP",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+    ])
+    .or_else(|| read_dib(CF_DIB as u32))
+    .or_else(|| read_dib(CF_DIBV5 as u32))
+    .or_else(|| read_bitmap());
     CloseClipboard();
     out
+}
+
+/// 解一段编码好的图片字节（PNG / JPEG / GIF / WEBP / BMP 都认，靠文件头自动判）。
+pub fn decode_any(bytes: &[u8]) -> Option<Bitmap> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 || w > 8192 || h > 8192 {
+        return None;
+    }
+    Some(Bitmap {
+        rgba: rgba.into_raw(),
+        w,
+        h,
+    })
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -72,26 +97,31 @@ pub fn describe_formats() -> String {
     }
 }
 
-unsafe fn read_png() -> Option<Bitmap> {
-    let fmt = RegisterClipboardFormatW(wide("PNG").as_ptr());
-    if fmt == 0 {
-        return None;
+unsafe fn read_registered(names: &[&str]) -> Option<Bitmap> {
+    for name in names {
+        let fmt = RegisterClipboardFormatW(wide(name).as_ptr());
+        if fmt == 0 {
+            continue;
+        }
+        let h = GetClipboardData(fmt as u32);
+        if h.is_null() {
+            continue;
+        }
+        let size = GlobalSize(h);
+        if size < 8 {
+            continue;
+        }
+        let p = GlobalLock(h) as *const u8;
+        if p.is_null() {
+            continue;
+        }
+        let bytes = std::slice::from_raw_parts(p, size).to_vec();
+        GlobalUnlock(h);
+        if let Some(bmp) = decode_any(&bytes) {
+            return Some(bmp);
+        }
     }
-    let h = GetClipboardData(fmt as u32);
-    if h.is_null() {
-        return None;
-    }
-    let size = GlobalSize(h);
-    if size < 8 {
-        return None;
-    }
-    let p = GlobalLock(h) as *const u8;
-    if p.is_null() {
-        return None;
-    }
-    let bytes = std::slice::from_raw_parts(p, size).to_vec();
-    GlobalUnlock(h);
-    decode_png(&bytes)
+    None
 }
 
 unsafe fn read_dib(fmt: u32) -> Option<Bitmap> {

@@ -76,7 +76,6 @@ const C_AMBER: u32 = 0x005B_B9F5; // #F5B95B
 const C_BORDER: u32 = 0x0032_2318; // #182332
 
 // 两块热区各自的底色，靠色相区分，不再用一条分隔线硬切
-const C_ZONE_TEXT_BG: u32 = 0x001C1E0E; // #0E1E1C 偏青
 const C_ROW_HOVER: u32 = 0x00281D12; // #121D28
 /// 选中的行：比悬浮再亮一档，靠「底色 + 满色边框」表示选中
 const C_ROW_SEL: u32 = 0x00342A19; // #192A34
@@ -224,7 +223,7 @@ pub struct App {
     page: AtomicIsize,
     scroll: AtomicIsize,
     hover: AtomicIsize,
-    /// 悬浮在哪个热区：0 无、1 粘贴、2 选文件
+    /// 鼠标是否停在顶部那张发送卡片上：0 否、1 是
     zone_hover: AtomicIsize,
     /// 底部浮动提示，1.2 秒后清掉
     hint: Mutex<Option<String>>,
@@ -950,16 +949,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let mut rc: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut rc);
                 let idx = row_at(&*app, rc.right, pt);
-                let zone = {
-                    let (_, text_r, file_r) = zone_rects(rc.right);
-                    if hit(&text_r, pt) {
-                        1
-                    } else if hit(&file_r, pt) {
-                        2
-                    } else {
-                        0
-                    }
-                };
+                let zone = if hit(&zone_rects(rc.right), pt) { 1 } else { 0 };
                 let prev = (*app).hover.swap(idx, Ordering::Relaxed);
                 let pz = (*app).zone_hover.swap(zone, Ordering::Relaxed);
                 if prev != idx || pz != zone {
@@ -1007,7 +997,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if is_hist {
                 let mut rc: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut rc);
-                let (_, text_r, file_r) = zone_rects(rc.right);
+                let card = zone_rects(rc.right);
                 let (x, y) = (((lp & 0xFFFF) as i16) as i32, (((lp >> 16) & 0xFFFF) as i16) as i32);
                 let pt = POINT { x, y };
                 // 先看「删除 N」那枚胶囊：它在标题行，和列表区不重叠，但顺序放在最前面免得起冲突
@@ -1017,9 +1007,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         return 0;
                     }
                 }
-                if hit(&text_r, pt) {
-                    send_clipboard(&*app, hwnd);
-                } else if hit(&file_r, pt) {
+                if hit(&card, pt) {
                     pick_file(&*app);
                 } else if let Some(sel) = peer_chip_at(&*app, rc.right, pt) {
                     (*app).set_target(sel);
@@ -1064,7 +1052,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if is_hist && !app.is_null() {
                 let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
                 if wp == VK_V as usize && ctrl {
-                    // 悬浮在哪块都行，Ctrl+V 直接发剪贴板里的文本
+                    // 焦点在哪都行，Ctrl+V 直接发剪贴板里的文本或图片
                     send_clipboard(&*app, hwnd);
                 } else if wp == VK_DELETE as usize {
                     delete_rows(&*app, hwnd);
@@ -1228,32 +1216,17 @@ fn peer_chip_at(app: &App, width: i32, pt: POINT) -> Option<Option<String>> {
     None
 }
 
-/// 顶部一张卡片，左右两半：左半粘贴文本（接 Ctrl+V），右半选择文件。
-/// 返回（整卡、左半、右半）。
-fn zone_rects(width: i32) -> (RECT, RECT, RECT) {
+/// 顶部一整张卡片：点它挑文件，Ctrl+V 直接粘剪贴板里的文本或图片。
+fn zone_rects(width: i32) -> RECT {
     let pad = 16;
     let top = 78;
     let h = 68;
-    let card = RECT {
+    RECT {
         left: pad,
         top,
         right: width - pad,
         bottom: top + h,
-    };
-    let mid = pad + (width - pad * 2) / 2;
-    let text = RECT {
-        left: pad,
-        top,
-        right: mid,
-        bottom: top + h,
-    };
-    let file = RECT {
-        left: mid,
-        top,
-        right: width - pad,
-        bottom: top + h,
-    };
-    (card, text, file)
+    }
 }
 
 fn badge_rect(width: i32) -> RECT {
@@ -1483,35 +1456,17 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
 
-    // 一张卡片，左右两半：左半粘贴文本（悬浮即接收 Ctrl+V），右半选择文件
-    let (card, text_z, file_z) = zone_rects(w);
-    let zh = app.zone_hover.load(Ordering::Relaxed);
-    fill_round(hdc, card, C_PANEL, if zh != 0 { C_TEAL } else { C_BORDER }, 10);
-    // 两半之间的细线
-    let pen = CreatePen(PS_SOLID, 1, C_BORDER);
-    let old_pen = SelectObject(hdc, pen as _);
-    MoveToEx(hdc, text_z.right, card.top + 14, ptr::null_mut());
-    LineTo(hdc, text_z.right, card.bottom - 14);
-    SelectObject(hdc, old_pen);
-    DeleteObject(pen as _);
-
-    paint_half(
+    // 一整张卡片就是发送入口：点它 = 挑文件，Ctrl+V = 直接粘剪贴板里的文本或图片
+    let card = zone_rects(w);
+    let hot = app.zone_hover.load(Ordering::Relaxed) != 0;
+    fill_round(hdc, card, C_PANEL, if hot { C_AMBER } else { C_BORDER }, 10);
+    paint_zone(
         hdc,
-        text_z,
-        zh == 1,
-        C_TEAL,
-        "粘贴文本",
-        "Ctrl+V 或点这里直接发送",
-        true,
-    );
-    paint_half(
-        hdc,
-        file_z,
-        zh == 2,
+        card,
+        hot,
         C_AMBER,
         "选择文件",
-        "也可以把文件拖进窗口",
-        false,
+        "点这里挑文件；Ctrl+V 直接粘贴文本或图片，也能拖文件进来",
     );
 
     // 发送目标：连着多台手机时给胶囊选择（默认「全部」广播），只连一台就只做说明
@@ -1676,7 +1631,7 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         );
         text_in(
             hdc,
-            "电脑上粘贴文本发出去，或手机上复制 / 发文件",
+            "点上方卡片挑文件、按 Ctrl+V 粘文本或图片，或手机上复制 / 发文件",
             RECT {
                 left: 16,
                 top: LIST_TOP + 80,
@@ -1827,18 +1782,10 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
     }
 }
 
-/// 卡片的一半：左侧图标 + 两行文案；悬浮时整半泛一点底色。
-unsafe fn paint_half(
-    hdc: HDC,
-    rc: RECT,
-    hot: bool,
-    accent: u32,
-    title: &str,
-    hint: &str,
-    clipboard_icon: bool,
-) {
+/// 顶部那张整卡：左侧图标 + 两行文案；悬浮时整卡泛一点底色。
+unsafe fn paint_zone(hdc: HDC, rc: RECT, hot: bool, accent: u32, title: &str, hint: &str) {
     if hot {
-        // 悬浮高亮：把这一半单独铺一层更亮的底色
+        // 悬浮高亮：整卡单独铺一层更亮的底色
         let hl = RECT {
             left: rc.left + 2,
             top: rc.top + 2,
@@ -1849,18 +1796,32 @@ unsafe fn paint_half(
     }
     let ix = rc.left + 20;
     let iy = rc.top + 20;
-    if clipboard_icon {
-        draw_clipboard(hdc, ix, iy, accent);
-    } else {
-        draw_folder_big(hdc, ix, iy, accent);
-    }
+    draw_folder_big(hdc, ix, iy, accent);
+    // 右边挂一枚快捷键提示，把这张宽卡片撑起来，也顺手告诉用户 Ctrl+V 能用
+    let label = "Ctrl+V";
+    let cw = 20 + chip_text_w(label);
+    let chip = RECT {
+        left: rc.right - 20 - cw,
+        top: rc.top + (rc.bottom - rc.top) / 2 - 12,
+        right: rc.right - 20,
+        bottom: rc.top + (rc.bottom - rc.top) / 2 + 12,
+    };
+    fill_round(hdc, chip, C_BG, if hot { accent } else { C_BORDER }, 12);
+    text_in(
+        hdc,
+        label,
+        chip,
+        small_font(),
+        if hot { accent } else { C_DIM },
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+    );
     text_in(
         hdc,
         title,
         RECT {
             left: ix + 32,
             top: rc.top + 14,
-            right: rc.right - 12,
+            right: chip.left - 16,
             bottom: rc.top + 44,
         },
         ui_font(),
@@ -1873,12 +1834,12 @@ unsafe fn paint_half(
         RECT {
             left: ix + 32,
             top: rc.top + 44,
-            right: rc.right - 12,
+            right: chip.left - 16,
             bottom: rc.top + 65,
         },
         small_font(),
         if hot { accent } else { C_FAINT },
-        DT_SINGLELINE | DT_VCENTER,
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
     );
 }
 
@@ -1941,60 +1902,6 @@ unsafe fn text_in(hdc: HDC, s: &str, mut rc: RECT, font: WPARAM, color: u32, fla
     SetTextColor(hdc, color);
     let w = wide(s);
     DrawTextW(hdc, w.as_ptr(), -1, &mut rc, flags);
-}
-
-/// 行首的方向箭头：向上（发出去）/ 向下（收进来）。
-
-/// 粘贴区图标：一块剪贴板（板 + 顶部夹子 + 两条内容线）。
-unsafe fn draw_clipboard(hdc: HDC, x: i32, y: i32, color: u32) {
-    let brush = CreateSolidBrush(color);
-    let _pb = SelectObject(hdc, brush as _);
-    let null_pen = GetStockObject(NULL_PEN as i32);
-    SelectObject(hdc, null_pen as _);
-    // 板身
-    let mut body = [
-        POINT { x, y: y + 4 },
-        POINT { x: x + 20, y: y + 4 },
-        POINT { x: x + 20, y: y + 22 },
-        POINT { x, y: y + 22 },
-    ];
-    Polygon(hdc, body.as_mut_ptr(), 4);
-    // 内芯（背景色挖空，做出边框感）
-    let inner = CreateSolidBrush(C_ZONE_TEXT_BG);
-    SelectObject(hdc, inner as _);
-    let mut hole = [
-        POINT { x: x + 2, y: y + 6 },
-        POINT { x: x + 18, y: y + 6 },
-        POINT { x: x + 18, y: y + 20 },
-        POINT { x: x + 2, y: y + 20 },
-    ];
-    Polygon(hdc, hole.as_mut_ptr(), 4);
-    SelectObject(hdc, brush as _);
-    // 顶部夹子
-    let mut tabl = [
-        POINT { x: x + 6, y: y },
-        POINT { x: x + 14, y: y },
-        POINT { x: x + 14, y: y + 4 },
-        POINT { x: x + 6, y: y + 4 },
-    ];
-    Polygon(hdc, tabl.as_mut_ptr(), 4);
-    // 两条内容线
-    let mut mini = [
-        POINT { x: x + 6, y: y + 10 },
-        POINT { x: x + 14, y: y + 10 },
-        POINT { x: x + 14, y: y + 12 },
-        POINT { x: x + 6, y: y + 12 },
-    ];
-    Polygon(hdc, mini.as_mut_ptr(), 4);
-    let mut mini2 = [
-        POINT { x: x + 6, y: y + 15 },
-        POINT { x: x + 12, y: y + 15 },
-        POINT { x: x + 12, y: y + 17 },
-        POINT { x: x + 6, y: y + 17 },
-    ];
-    Polygon(hdc, mini2.as_mut_ptr(), 4);
-    DeleteObject(inner as _);
-    DeleteObject(brush as _);
 }
 
 /// 文本行图标：两张叠纸（点一下就复制）。
