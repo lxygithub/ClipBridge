@@ -11,12 +11,13 @@ data class ClipItem(
 )
 
 /** 跨界面共享的连接状态（Rust 回调线程写，UI 读）。 */
-/** 手机收到的一个文件（来自 Rust 侧 inbox 扫描）。 */
+/** 手机上的一个文件条目：收（inbox 落地）或发（只是流水，文件本体在电脑上）。 */
 data class RecvFile(
     val name: String,
     val size: Long,
     val path: String,
-    val mtime: Long
+    val mtime: Long,
+    val outgoing: Boolean = false
 )
 
 object BridgeState {
@@ -32,6 +33,9 @@ object BridgeState {
 
     /** 收到的文件列表 */
     val files = MutableStateFlow<List<RecvFile>>(emptyList())
+
+    /** 电脑的显示名（来自电脑的 HELLO），列表里「发往 xxx / 来自 xxx」用它 */
+    val peerName = MutableStateFlow("")
 
     fun set(newState: String) {
         state.value = newState

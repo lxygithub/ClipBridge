@@ -122,8 +122,7 @@ class MainActivity : ComponentActivity() {
                     prefs.peerId = peer
                     prefs.relay = relay
                     SyncService.start(this)
-                },
-                onStop = { SyncService.stop(this) }
+                }
             )
         }
     }
@@ -140,21 +139,21 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ChannelScreen(
     peerId: String,
-    onSave: (String, String) -> Unit,
-    onStop: () -> Unit
+    onSave: (String, String) -> Unit
 ) {
     val ctx = LocalContext.current
     val state by BridgeState.state.collectAsState()
     val items by BridgeState.items.collectAsState()
-    val sent by BridgeState.sentCount.collectAsState()
     val link by BridgeState.link.collectAsState()
     val files by BridgeState.files.collectAsState()
+    val peerName by BridgeState.peerName.collectAsState()
 
-    // 链路状态和文件列表都来自 Rust 侧，2 秒拉一次（读 mutex/扫目录，开销可忽略）
+    // 链路状态、对端名字和文件列表都来自 Rust 侧，2 秒拉一次（读 mutex/扫目录，开销可忽略）
     LaunchedEffect(Unit) {
         while (true) {
             withContext(Dispatchers.IO) {
                 BridgeState.link.value = runCatching { Native.nativePathStatus() }.getOrDefault("")
+                BridgeState.peerName.value = runCatching { Native.nativePeerName() }.getOrDefault("")
                 val raw = runCatching { Native.nativeListFiles() }.getOrDefault("[]")
                 BridgeState.files.value = parseFiles(raw)
             }
@@ -162,12 +161,13 @@ private fun ChannelScreen(
         }
     }
 
-    var statsOpen by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<ClipItem?>(null) }
 
     val connected = state == "connected"
     val accent = if (connected) Palette.teal else Color(0xFF8795A4)
+    // 电脑的显示名：没收到过就用短 id 兜底
+    val pcName = peerName.ifBlank { "PC · ${peerId.take(8)}…" }
 
     // 手机 → 电脑发文件：选一个文档，先复制到应用缓存再交给 native
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -225,30 +225,26 @@ private fun ChannelScreen(
 
         NodeCard(
             connected = connected,
-            peerId = peerId,
+            title = pcName,
             state = state,
             accent = accent,
             link = link
-        ) {
-            statsOpen = !statsOpen
-        }
-
-        if (statsOpen) {
-            Spacer(Modifier.height(10.dp))
-            StatsCard(
-                total = items.size,
-                down = items.count { !it.outgoing },
-                up = sent,
-                state = state
-            )
-        }
+        )
 
         if (files.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
             FilesSection(
+                peerName = pcName,
                 files = files,
                 onShare = { shareFile(ctx, File(it.path)) },
-                onOpen = { openFile(ctx, File(it.path)) }
+                onOpen = { f ->
+                    // 发出去的文件只留在电脑上，手机上点开没有意义
+                    if (f.outgoing || f.path.isBlank()) {
+                        toast(ctx, "这个文件已经在「$pcName」上")
+                    } else {
+                        openFile(ctx, File(f.path))
+                    }
+                }
             )
         }
 
@@ -273,7 +269,7 @@ private fun ChannelScreen(
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
                     items(items, key = { "${it.seq}-${it.ts}" }) { item ->
-                        TimelineRow(item) { selected = item }
+                        TimelineRow(item, pcName) { selected = item }
                     }
                     item {
                         Text(
@@ -288,8 +284,7 @@ private fun ChannelScreen(
             }
         }
 
-        FlowBar(down = items.count { !it.outgoing }, up = sent)
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(12.dp))
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlineAction("发送当前剪贴板", Palette.teal, Modifier.weight(1f)) {
@@ -306,12 +301,8 @@ private fun ChannelScreen(
                     }.start()
                 }
             }
-            OutlineAction("发文件", Palette.amber, Modifier.width(88.dp)) {
+            OutlineAction("发文件", Palette.amber, Modifier.weight(1f)) {
                 pickFile.launch(arrayOf("*/*"))
-            }
-            OutlineAction("断开", Palette.dim, Modifier.width(64.dp)) {
-                onStop()
-                toast(ctx, "已断开")
             }
         }
         Spacer(Modifier.height(22.dp))
@@ -323,7 +314,7 @@ private fun ChannelScreen(
             containerColor = Palette.panel,
             title = {
                 Text(
-                    if (item.outgoing) "发往电脑" else "来自电脑",
+                    if (item.outgoing) "发往 $pcName" else "来自 $pcName",
                     color = Palette.ink,
                     fontSize = 14.sp
                 )
@@ -383,11 +374,10 @@ private fun ChannelScreen(
 @Composable
 private fun NodeCard(
     connected: Boolean,
-    peerId: String,
+    title: String,
     state: String,
     accent: Color,
-    link: String,
-    onClick: () -> Unit
+    link: String
 ) {
     Row(
         modifier = Modifier
@@ -395,7 +385,6 @@ private fun NodeCard(
             .padding(top = 10.dp)
             .background(Palette.panel, RoundedCornerShape(6.dp))
             .border(1.dp, Palette.border, RoundedCornerShape(6.dp))
-            .clickable { onClick() }
             .padding(horizontal = 14.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -403,13 +392,16 @@ private fun NodeCard(
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
             Text(
-                "PC · ${peerId.take(8)}…",
+                // 电脑的显示名（来自电脑的 HELLO）；没连上时 URL 里只有短 id 也不丑
+                title,
                 color = Palette.ink,
-                fontSize = 13.sp,
-                fontFamily = FontFamily.Monospace
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
             Text(
-                Notifier.stateText(state),
+                if (connected) "已连接 · ${Notifier.stateText(state)}" else Notifier.stateText(state),
                 color = Palette.dim,
                 fontSize = 10.sp,
                 modifier = Modifier.padding(top = 2.dp)
@@ -462,34 +454,7 @@ private fun PathChip(link: String) {
 }
 
 @Composable
-private fun StatsCard(total: Int, down: Int, up: Int, state: String) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .background(Palette.panel, RoundedCornerShape(4.dp))
-            .border(1.dp, Palette.border, RoundedCornerShape(4.dp))
-            .padding(14.dp)
-    ) {
-        Text("通道统计", color = Palette.faint, fontSize = 9.sp, letterSpacing = 1.6.sp)
-        Spacer(Modifier.height(8.dp))
-        StatLine("连接状态", Notifier.stateText(state))
-        StatLine("本次界面条数", "$total")
-        StatLine("下行 / 上行", "$down / $up")
-        StatLine("同步水位", "#${BridgeState.lastSeq.value}")
-    }
-}
-
-@Composable
-private fun StatLine(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-        Text(label, color = Palette.dim, fontSize = 11.sp)
-        Spacer(Modifier.weight(1f))
-        Text(value, color = Palette.ink, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-    }
-}
-
-@Composable
-private fun TimelineRow(item: ClipItem, onClick: () -> Unit) {
+private fun TimelineRow(item: ClipItem, peer: String, onClick: () -> Unit) {
     val accent = if (item.outgoing) Palette.amber else Palette.teal
     Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
         Box(Modifier.width(30.dp).fillMaxHeight()) {
@@ -511,7 +476,8 @@ private fun TimelineRow(item: ClipItem, onClick: () -> Unit) {
         }
         Column(Modifier.weight(1f).padding(top = 4.dp, bottom = 8.dp)) {
             Text(
-                clockFormat.format(Date(item.ts)) + if (item.outgoing) " · 发往电脑" else " · 来自电脑",
+                clockFormat.format(Date(item.ts)) +
+                    if (item.outgoing) " · 发往 $peer" else " · 来自 $peer",
                 color = Palette.faint,
                 fontSize = 9.sp,
                 fontFamily = FontFamily.Monospace,
@@ -550,30 +516,6 @@ private fun TimelineRow(item: ClipItem, onClick: () -> Unit) {
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun FlowBar(down: Int, up: Int) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .background(Palette.panel, RoundedCornerShape(4.dp))
-            .border(1.dp, Palette.border, RoundedCornerShape(4.dp))
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text("下行", color = Palette.faint, fontSize = 9.sp, letterSpacing = 1.sp)
-        Spacer(Modifier.width(8.dp))
-        Box(Modifier.weight(1f).height(2.dp).background(Palette.teal.copy(alpha = 0.5f)))
-        Spacer(Modifier.width(8.dp))
-        Text("$down", color = Palette.teal, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
-        Spacer(Modifier.width(14.dp))
-        Text("上行", color = Palette.faint, fontSize = 9.sp, letterSpacing = 1.sp)
-        Spacer(Modifier.width(8.dp))
-        Box(Modifier.weight(1f).height(2.dp).background(Palette.amber.copy(alpha = 0.5f)))
-        Spacer(Modifier.width(8.dp))
-        Text("$up", color = Palette.amber, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
     }
 }
 
@@ -659,10 +601,12 @@ private fun DetailAction(label: String, onClick: () -> Unit) {
     }
 }
 
-/// 收到的文件：点一下用系统播放器打开，长按分享给别的 app。
+/// 文件区：收（inbox 里落地的）和发（发出去的流水）都列，行里标「发往 xxx / 来自 xxx」。
+/// 收到的：点一下用系统播放器打开，长按分享；发出去的文件本体在电脑上，点了只提示位置。
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun FilesSection(
+    peerName: String,
     files: List<RecvFile>,
     onShare: (RecvFile) -> Unit,
     onOpen: (RecvFile) -> Unit
@@ -676,10 +620,15 @@ private fun FilesSection(
                 letterSpacing = 1.4.sp
             )
             Spacer(Modifier.weight(1f))
-            Text("长按分享", color = Palette.faint, fontSize = 9.sp)
+            Text(
+                "收 ${files.count { !it.outgoing }} · 发 ${files.count { it.outgoing }}",
+                color = Palette.faint,
+                fontSize = 9.sp
+            )
         }
         Spacer(Modifier.height(4.dp))
-        files.take(4).forEach { f ->
+        files.take(6).forEach { f ->
+            val accent = if (f.outgoing) Palette.amber else Palette.teal
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -688,22 +637,40 @@ private fun FilesSection(
                     .border(1.dp, Palette.border, RoundedCornerShape(3.dp))
                     .combinedClickable(
                         onClick = { onOpen(f) },
-                        onLongClick = { onShare(f) }
+                        onLongClick = { if (!f.outgoing && f.path.isNotBlank()) onShare(f) }
                     )
-                    .padding(horizontal = 11.dp, vertical = 9.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .height(IntrinsicSize.Min)
             ) {
-                Text(
-                    f.name,
-                    color = Palette.ink,
-                    fontSize = 12.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(humanSize(f.size), color = Palette.faint, fontSize = 10.sp)
+                // 方向色条：和文本条目同一套语义（发=琥珀、收=青）
+                Box(Modifier.width(2.dp).fillMaxHeight().background(accent))
+                Column(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
+                    Text(
+                        f.name,
+                        color = Palette.ink,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        // 「发往 / 来自」带上设备名，才知道这份文件归谁
+                        (if (f.outgoing) "发往 $peerName" else "来自 $peerName") +
+                            " · " + humanSize(f.size),
+                        color = Palette.faint,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
+        }
+        if (files.size > 6) {
+            Text(
+                "还有 ${files.size - 6} 个文件",
+                color = Palette.faint,
+                fontSize = 9.sp,
+                modifier = Modifier.padding(top = 4.dp, start = 2.dp)
+            )
         }
     }
 }
@@ -716,7 +683,8 @@ private fun parseFiles(raw: String): List<RecvFile> = runCatching {
             name = o.optString("name"),
             size = o.optLong("size"),
             path = o.optString("path"),
-            mtime = o.optLong("mtime")
+            mtime = o.optLong("mtime"),
+            outgoing = o.optBoolean("outgoing", false)
         )
     }
 }.getOrDefault(emptyList())

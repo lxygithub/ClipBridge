@@ -3,6 +3,7 @@ package top.ieop.clipbridge
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 
@@ -57,13 +58,28 @@ class SyncService : Service(), BridgeListener {
         val relay = prefs.relay
         // 建端点会阻塞几秒（等 relay online），不能占主线程
         Thread({
-            val ok = runCatching { Native.nativeStart(dir, peer, relay, this) }.getOrDefault(false)
+            val ok = runCatching {
+                Native.nativeStart(dir, peer, relay, deviceName(), this)
+            }.getOrDefault(false)
             if (!ok) {
                 started = false
                 BridgeState.set("error:启动失败")
                 Notifier.updateService(this, "error:启动失败")
             }
         }, "bridge-start").start()
+    }
+
+    /** 电脑端要显示的设备名：厂商 + 型号，去掉「小米 小米15」这种重复前缀。 */
+    private fun deviceName(): String {
+        val model = Build.MODEL?.trim().orEmpty()
+        val brand = Build.MANUFACTURER?.trim().orEmpty()
+        if (model.isEmpty()) return "Android"
+        val pretty = model.replaceFirstChar { it.uppercase() }
+        return if (brand.isEmpty() || model.lowercase().startsWith(brand.lowercase())) {
+            pretty
+        } else {
+            "$brand $pretty"
+        }
     }
 
     override fun onClipText(seq: Long, text: String) {

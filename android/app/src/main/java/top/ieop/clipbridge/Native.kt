@@ -10,8 +10,8 @@ object Native {
         System.loadLibrary("clipbridge_android")
     }
 
-    /** 启动长连接会话；listener 需实现 [BridgeListener]。 */
-    external fun nativeStart(dir: String, peer: String, relay: String, listener: Any): Boolean
+    /** 启动长连接会话；deviceName 会随 HELLO 发给电脑，电脑端显示「已连接 <名字>」。 */
+    external fun nativeStart(dir: String, peer: String, relay: String, deviceName: String, listener: Any): Boolean
 
     external fun nativeStop()
 
@@ -32,8 +32,11 @@ object Native {
     /** 当前链路：`direct|12`（直连 12ms）/ `relay|312` / 空串（没连上） */
     external fun nativePathStatus(): String
 
-    /** 手机收到的文件，JSON 数组：[{name,size,mtime,path}] */
+    /** 手机收到的文件 + 手机发出去的文件，JSON 数组：[{name,size,mtime,path,outgoing}] */
     external fun nativeListFiles(): String
+
+    /** 电脑的显示名（来自电脑发的 HELLO），没连过就是空串 */
+    external fun nativePeerName(): String
 }
 
 /** Rust 侧通过 JNI 回调这些方法，方法名与签名必须保持一致。 */

@@ -7,18 +7,38 @@ import android.os.Bundle
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
 
 /**
  * 所有「不打开 app」的发送入口都落到这里：
- *  - 桌面长按快捷方式（SEND_CLIP）
+ *  - 桌面长按快捷方式（SEND_CLIP / SEND_FILE）
  *  - 分享面板（ACTION_SEND / ACTION_SEND_MULTIPLE：文本、图片、任意文件）
  *  - 快捷设置磁贴（内部转成 SEND_CLIP）
  *
- * 之所以必须是 Activity：Android 10+ 只有获得焦点的应用才能读剪贴板。
- * 界面用 1dp 透明主题，处理完立刻 finish()，用户只看到一闪。
+ * 之所以必须是 Activity：Android 10+ 只有**获得焦点**的应用才能读剪贴板。
+ * 界面用透明主题，处理完立刻 finish()，用户只看到一闪。
+ *
+ * 踩过的坑（都别再改回去）：
+ *  1. 剪贴板不能在 onCreate 里读 —— 那时还没有窗口焦点，`primaryClip` 一定返回 null，
+ *     表现就是「提示剪贴板为空」。必须等 onWindowFocusChanged(true)，再重试几帧。
+ *  2. SEND_FILE 快捷方式原来没进 when 分支，直接走 else -> finish()，
+ *     所以「发送文件到电脑」点了没任何反应。现在会拉起系统文件选择器。
  */
 class QuickSendActivity : ComponentActivity() {
+
+    /** SEND_CLIP 要等焦点；已经处理过就不再重复 */
+    private var clipHandled = false
+    private var wantClipboard = false
+
+    private val pickFile =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) {
+                finish()
+            } else {
+                runSendFile(listOf(uri))
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -32,24 +52,47 @@ class QuickSendActivity : ComponentActivity() {
         SyncService.start(this)
 
         when (intent?.action) {
-            ACTION_SEND_CLIP -> sendClipboard()
+            ACTION_SEND_CLIP -> wantClipboard = true
+            ACTION_SEND_FILE -> pickFile.launch(arrayOf("*/*"))
             Intent.ACTION_SEND -> sendItem(intent)
             Intent.ACTION_SEND_MULTIPLE -> sendItems(intent)
             else -> finish()
         }
     }
 
-    private fun sendClipboard() {
-        val cm = getSystemService(ClipboardManager::class.java)
-        val clip = cm.primaryClip
-        val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).text?.toString() else null
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && wantClipboard && !clipHandled) {
+            clipHandled = true
+            // 焦点刚拿到的那一帧，系统可能还没放行剪贴板读取：延后一帧再试
+            window.decorView.post { sendClipboard(0) }
+        }
+    }
+
+    /**
+     * 读剪贴板并发送。读不到就小幅重试（150ms x 4），都失败才提示为空——
+     * 这样「刚复制完立刻点快捷方式」也不会误报。
+     */
+    private fun sendClipboard(attempt: Int) {
+        val text = readClip()
         if (text.isNullOrBlank()) {
-            toast("剪贴板为空")
-            finish()
+            if (attempt < 4) {
+                window.decorView.postDelayed({ sendClipboard(attempt + 1) }, 150)
+            } else {
+                toast("剪贴板为空")
+                finish()
+            }
             return
         }
         runSend(text)
     }
+
+    private fun readClip(): String? = runCatching {
+        val cm = getSystemService(ClipboardManager::class.java)
+        val clip = cm?.primaryClip
+        if (clip == null || clip.itemCount == 0) null
+        else clip.getItemAt(0).text?.toString()
+    }.getOrNull()
 
     private fun sendItem(intent: Intent) {
         val text = intent.getStringExtra(Intent.EXTRA_TEXT)
@@ -130,6 +173,10 @@ class QuickSendActivity : ComponentActivity() {
      */
     private fun runSendFile(uris: List<Uri>) {
         Thread({
+            if (uris.isEmpty()) {
+                runOnUiThread { finish() }
+                return@Thread
+            }
             var sent = 0
             for (uri in uris) {
                 val name = displayName(uri)
@@ -186,5 +233,6 @@ class QuickSendActivity : ComponentActivity() {
 
     companion object {
         const val ACTION_SEND_CLIP = "top.ieop.clipbridge.SEND_CLIP"
+        const val ACTION_SEND_FILE = "top.ieop.clipbridge.SEND_FILE"
     }
 }

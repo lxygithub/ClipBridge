@@ -26,6 +26,9 @@ static SESSION: OnceLock<Mutex<Option<Arc<Session>>>> = OnceLock::new();
 /// UI 每 2 秒通过 `nativePathStatus` 读一次。
 static LINK: Mutex<String> = Mutex::new(String::new());
 
+/// 对端（电脑）的显示名，来自电脑连上来后发的 HELLO。UI 每 2 秒读一次。
+static PEER_NAME: Mutex<String> = Mutex::new(String::new());
+
 fn rt() -> &'static Runtime {
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -49,6 +52,8 @@ struct Session {
     dir: PathBuf,
     peer: String,
     relay: String,
+    /// 本机显示名（HELLO 里带给电脑识别用）
+    device: String,
     acked: AtomicU64,
     /// 已报价、等待数据流的文件：id → (offer, .part 路径)
     pending: Mutex<std::collections::HashMap<String, (transfer::Offer, PathBuf)>>,
@@ -144,13 +149,52 @@ impl Session {
         self.ep.connect(addr, ALPN).await.context("connect to windows")
     }
 
-    /// 连上后先发 HELLO（带已确认 seq），让 Windows 补发错过的条目。
+    /// 连上后先发 HELLO（带已确认 seq + 本机名），让 Windows 补发错过的条目、
+    /// 并在电脑端显示出「已连接 <手机名>」。
     async fn hello(&self, conn: &Connection) -> Result<()> {
         let (mut send, _recv) = conn.open_bi().await.context("open hello stream")?;
-        let payload = format!("v1|{}|android", self.acked.load(Ordering::Relaxed));
+        let name = if self.device.trim().is_empty() {
+            "Android".to_string()
+        } else {
+            self.device.clone()
+        };
+        let payload = format!("v1|{}|{}", self.acked.load(Ordering::Relaxed), name);
         protocol::write_frame(&mut send, protocol::MSG_HELLO, payload.as_bytes()).await?;
         send.finish().ok();
         Ok(())
+    }
+
+    /// 发出去的文件记一笔：手机本地不保留文件（发完就删了），
+    /// 列表要能显示「发送给 xxx」，只能靠这份流水。
+    fn record_sent_file(&self, path: &PathBuf, size: u64) {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".into());
+        let ledger = self.dir.join("sent_files.json");
+        let mut list: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        list.retain(|v| v["name"].as_str() != Some(name.as_str()));
+        list.insert(
+            0,
+            serde_json::json!({
+                "name": name,
+                "size": size,
+                "mtime": now,
+                "path": "",
+                "outgoing": true,
+            }),
+        );
+        list.truncate(200);
+        if let Ok(json) = serde_json::to_string(&list) {
+            let _ = std::fs::write(&ledger, json);
+        }
     }
 }
 
@@ -239,6 +283,15 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                 return;
             };
             match ty {
+                protocol::MSG_HELLO => {
+                    // "v1|<seq>|<device_name>"：电脑连上来后发的自我介绍，UI 用来显示设备名
+                    let body = String::from_utf8_lossy(&payload).to_string();
+                    let name = body.split('|').nth(2).unwrap_or("").trim().to_string();
+                    if !name.is_empty() {
+                        *PEER_NAME.lock().unwrap() = name;
+                    }
+                    let _ = send.finish();
+                }
                 protocol::MSG_CLIP_TEXT => {
                     let body = String::from_utf8_lossy(&payload).to_string();
                     let (seq, text) = body.split_once('|').unwrap_or(("0", &body));
@@ -495,7 +548,7 @@ impl Session {
             .unwrap()
             .insert(id.clone(), name.clone());
 
-        rt().block_on(async {
+        let ok = rt().block_on(async {
             let conn = {
                 let guard = self.conn.lock().unwrap();
                 guard.clone()
@@ -559,7 +612,12 @@ impl Session {
                     false
                 }
             }
-        })
+        });
+        if ok {
+            // 文件已经落到电脑上了：手机端只留一条流水，供列表显示「发送给 xxx」
+            self.record_sent_file(&p, size);
+        }
+        ok
     }
 }
 
@@ -576,7 +634,7 @@ fn jstring_to_string(env: &mut JNIEnv, s: &JString) -> String {
         .unwrap_or_else(|_| String::new())
 }
 
-/// `Native.start(dir, peerId, relayUrl, listener)`
+/// `Native.start(dir, peerId, relayUrl, deviceName, listener)`
 #[no_mangle]
 pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
     mut env: JNIEnv,
@@ -584,11 +642,13 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
     dir: JString,
     peer: JString,
     relay: JString,
+    device: JString,
     listener: JObject,
 ) -> jboolean {
     let dir_s = jstring_to_string(&mut env, &dir);
     let peer_s = jstring_to_string(&mut env, &peer);
     let relay_s = jstring_to_string(&mut env, &relay);
+    let device_s = jstring_to_string(&mut env, &device);
     if peer_s.trim().is_empty() {
         return JNI_FALSE;
     }
@@ -634,6 +694,7 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
         dir: dir_path.clone(),
         peer: peer_s,
         relay: relay_s,
+        device: device_s,
         acked: AtomicU64::new(read_last_seq(&dir_path)),
         pending: Mutex::new(std::collections::HashMap::new()),
         outgoing: Mutex::new(std::collections::HashMap::new()),
@@ -641,6 +702,7 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeStart(
     });
 
     *slot().lock().unwrap() = Some(Arc::clone(&sess));
+    *PEER_NAME.lock().unwrap() = String::new();
     let handle = rt().handle().clone();
     // 手机侧没有任何 stdout：QAD/NAT 结论只能写进 files/diag.log 再 adb 拉出来。
     // 这是判断「打洞为什么不成」的唯一现场证据（PC 侧只看得到手机发布的候选地址）。
@@ -830,6 +892,9 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativePathStatus(
 }
 
 /// `Native.listFiles()` → JSON 数组：手机收到的文件（主界面文件区、长按分享用）。
+/// `Native.listFiles()` → JSON 数组，收发两个方向都列：
+///   * `inbox/` 里落地的 = 电脑发过来的（outgoing=false）
+///   * `sent_files.json` 流水 = 手机发出去的（outgoing=true，文件本体在电脑上）
 #[no_mangle]
 pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeListFiles(
     mut env: JNIEnv,
@@ -838,10 +903,18 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeListFiles(
     let dir = slot().lock().unwrap().as_ref().map(|s| s.dir.clone());
     let mut rows = Vec::new();
     if let Some(dir) = dir {
+        // 收到的
         if let Ok(entries) = std::fs::read_dir(dir.join("inbox")) {
             for e in entries.flatten() {
                 let p = e.path();
                 if !p.is_file() {
+                    continue;
+                }
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if name.ends_with(".part") {
                     continue;
                 }
                 let Ok(meta) = e.metadata() else { continue };
@@ -852,11 +925,25 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeListFiles(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 rows.push(serde_json::json!({
-                    "name": p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    "name": name,
                     "size": meta.len(),
                     "mtime": mtime,
                     "path": p.to_string_lossy(),
+                    "outgoing": false,
                 }));
+            }
+        }
+        // 发出去的
+        if let Ok(text) = std::fs::read_to_string(dir.join("sent_files.json")) {
+            if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                for v in list {
+                    let mut v = v;
+                    v["outgoing"] = serde_json::json!(true);
+                    if v.get("path").is_none() {
+                        v["path"] = serde_json::json!("");
+                    }
+                    rows.push(v);
+                }
             }
         }
     }
@@ -864,6 +951,19 @@ pub extern "system" fn Java_top_ieop_clipbridge_Native_nativeListFiles(
     rows.truncate(200);
     let json = serde_json::Value::Array(rows).to_string();
     match env.new_string(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// `Native.peerName()`：电脑的显示名（来自电脑的 HELLO），没连过就是空串。
+#[no_mangle]
+pub extern "system" fn Java_top_ieop_clipbridge_Native_nativePeerName(
+    mut env: JNIEnv,
+    _class: JObject,
+) -> jstring {
+    let name = PEER_NAME.lock().unwrap().clone();
+    match env.new_string(name) {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }

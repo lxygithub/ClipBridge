@@ -398,6 +398,16 @@ fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOp
     Ok(())
 }
 
+/// 电脑的显示名：手机端节点卡上要能看到「已连接 <这个名字>」。
+/// 取 `COMPUTERNAME`（Windows 默认就是主机名），取不到退回通用名。
+fn pc_device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Windows PC".to_string())
+}
+
 async fn serve_net(
     secret: iroh::SecretKey,
     store: Arc<Store>,
@@ -517,6 +527,7 @@ async fn serve_net(
         let outgoing = Arc::clone(&outgoing);
         let inbox = inbox.clone();
         let completions = Arc::clone(&completions);
+        let app_h = Arc::clone(&app);
     let ep_for_peer = ep.clone();
         tokio::spawn(async move {
             let Ok(accepting) = incoming.accept() else { return };
@@ -524,6 +535,20 @@ async fn serve_net(
             let id = conn.remote_id();
             println!("[conn] accepted {} ({id})", id.fmt_short());
             peers.lock().await.insert(id, conn.clone());
+
+            // 反向自我介绍：手机端的节点卡要显示电脑名，不然只能看到一串 id。
+            // 走一条独立 bi 流，和 HELLO/补发逻辑互不干扰。
+            {
+                let hello_conn = conn.clone();
+                tokio::spawn(async move {
+                    if let Ok((mut s, _r)) = hello_conn.open_bi().await {
+                        let payload = format!("v1|0|{}", pc_device_name());
+                        let _ = protocol::write_frame(&mut s, protocol::MSG_HELLO, payload.as_bytes())
+                            .await;
+                        let _ = s.finish();
+                    }
+                });
+            }
             // 对端「发布了哪些候选地址」+ 当前实际路径，是判断它那边 QAD 成功没有的直接证据：
             // 只有 relay 一条 = 它没测到自己公网映射，打洞不可能成。
             // 打洞要 1–4 秒，建连瞬间的快照只有 relay；所以打两次，
@@ -581,7 +606,9 @@ async fn serve_net(
                     );
                 }
             });
-            if let Err(err) = handle_conn(conn, store, pending, outgoing, completions, inbox).await {
+            if let Err(err) =
+                handle_conn(conn, store, pending, outgoing, completions, inbox, app_h).await
+            {
                 eprintln!("[conn] {err:#}");
             }
             peers.lock().await.remove(&id);
@@ -598,6 +625,7 @@ async fn handle_conn(
     outgoing: Outgoing,
     completions: Completions,
     inbox: PathBuf,
+    app: Arc<ui::App>,
 ) -> Result<()> {
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
@@ -610,6 +638,7 @@ async fn handle_conn(
         let outgoing = Arc::clone(&outgoing);
         let completions = Arc::clone(&completions);
         let inbox = inbox.clone();
+        let app = Arc::clone(&app);
         tokio::spawn(async move {
             let Ok(Some((ty, payload))) = protocol::read_frame(&mut recv).await else {
                 return;
@@ -623,7 +652,12 @@ async fn handle_conn(
                         .nth(1)
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or(0);
-                    println!("[hello] since #{last_seq}");
+                    let name = body.split('|').nth(2).unwrap_or("").trim().to_string();
+                    println!("[hello] since #{last_seq} from {}", if name.is_empty() { "?" } else { &name });
+                    if !name.is_empty() {
+                        // 手机名进 UI：标题徽标与列表行都要显示「发送给 / 来自 xxx」
+                        app.set_peer_name(name);
+                    }
                     match store.since(last_seq) {
                         Ok(items) => {
                             println!("[replay] {} item(s)", items.len());

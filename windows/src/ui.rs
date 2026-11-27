@@ -166,6 +166,8 @@ pub struct App {
     items: Mutex<Vec<HistoryItem>>,
     rows: Mutex<Vec<Row>>,
     link: Mutex<LinkInfo>,
+    /// 已连接设备（手机）的显示名，来自手机 HELLO；用来在标题下和列表行里标"发送给/来自 xxx"
+    peer_name: Mutex<String>,
     inbox: PathBuf,
     outbox: PathBuf,
     sender: Mutex<Option<UnboundedSender<String>>>,
@@ -195,6 +197,7 @@ impl App {
             items: Mutex::new(items),
             rows: Mutex::new(Vec::new()),
             link: Mutex::new(LinkInfo::default()),
+            peer_name: Mutex::new(String::new()),
             inbox: dir.join("inbox"),
             outbox: dir.join("outbox"),
             sender: Mutex::new(None),
@@ -231,6 +234,32 @@ impl App {
         drop(cur);
         if changed {
             self.refresh();
+        }
+    }
+
+    /// 手机连上来时报上自己的名字；变了就重绘（标题下的设备名 + 列表行的「发送给/来自」都要跟着变）。
+    pub fn set_peer_name(&self, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut cur = self.peer_name.lock().unwrap();
+            let changed = *cur != name;
+            *cur = name;
+            changed
+        };
+        if changed {
+            self.refresh();
+        }
+    }
+
+    fn peer_label(&self) -> String {
+        let name = self.peer_name.lock().unwrap().clone();
+        if name.is_empty() {
+            "手机".to_string()
+        } else {
+            name
         }
     }
 
@@ -628,7 +657,7 @@ fn hit(rc: &RECT, pt: POINT) -> bool {
 /// 返回（整卡、左半、右半）。
 fn zone_rects(width: i32) -> (RECT, RECT, RECT) {
     let pad = 16;
-    let top = 62;
+    let top = 78;
     let h = 82;
     let card = RECT {
         left: pad,
@@ -784,13 +813,36 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
         "ClipBridge",
         RECT {
             left: 16,
-            top: 12,
+            top: 8,
             right: w - 260,
-            bottom: 52,
+            bottom: 44,
         },
         title_font(),
         C_INK,
         DT_SINGLELINE | DT_VCENTER,
+    );
+
+    // 副标题：已连接的设备名（手机报上来的名字；没连就写未连接）
+    let (sub_text, sub_color) = {
+        let connected = app.link.lock().unwrap().connected;
+        if connected {
+            (format!("已连接 · {}", app.peer_label()), C_DIM)
+        } else {
+            ("未连接（手机连上后自动显示设备名）".to_string(), C_FAINT)
+        }
+    };
+    text_in(
+        hdc,
+        &sub_text,
+        RECT {
+            left: 18,
+            top: 44,
+            right: w - 260,
+            bottom: 72,
+        },
+        small_font(),
+        sub_color,
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
     );
 
     // 页面切换：条目页 ↔ 日志页，同一个窗口里翻
@@ -976,7 +1028,7 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
                 RECT {
                     left: r.left + 40,
                     top: r.top + 6,
-                    right: meta_right - 86,
+                    right: meta_right - 168,
                     bottom: r.bottom - 6,
                 },
                 ui_font(),
@@ -987,7 +1039,7 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
                 hdc,
                 &row.meta,
                 RECT {
-                    left: meta_right - 150,
+                    left: meta_right - 232,
                     top: r.top + 6,
                     right: meta_right,
                     bottom: r.bottom - 6,
@@ -1261,6 +1313,7 @@ unsafe fn draw_folder_big(hdc: HDC, x: i32, y: i32, color: u32) {
 /// 列表数据：条目页 = 文本 + 文件；日志页 = 只有文本。返回是否有变化。
 unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
     let log_page = app.page() == 1;
+    let peer = app.peer_label();
     let mut rows: Vec<Row> = Vec::new();
 
     for it in app.items.lock().unwrap().iter() {
@@ -1280,12 +1333,19 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
             // store 里的文本都是电脑发出去的（手机发来的只写剪贴板、不入队）
             outgoing: true,
             title: head.trim().replace('\t', " "),
-            meta: format!("已发 · {}", fmt_time(it.mtime)),
+            meta: format!("发给 {peer} · {}", fmt_time(it.mtime)),
         });
     }
 
     if !log_page {
-        for (dir, outgoing) in [(&app.outbox, true), (&app.inbox, false)] {
+        // 发出去的文件会被 watch_outbox 挪到 outbox/sent/，只扫 outbox 的话
+        // 列表里一发完就消失，看起来就是「和手机端不同步」。三个目录都要扫。
+        let sent_dir = app.outbox.join("sent");
+        for (dir, outgoing) in [
+            (&app.outbox, true),
+            (&sent_dir, true),
+            (&app.inbox, false),
+        ] {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
@@ -1317,7 +1377,11 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
                     meta: format!(
                         "{} · {}",
                         human_size(meta.len()),
-                        if outgoing { "已发" } else { "已收" }
+                        if outgoing {
+                            format!("发给 {peer}")
+                        } else {
+                            format!("来自 {peer}")
+                        }
                     ),
                 });
             }
@@ -1332,7 +1396,12 @@ unsafe fn refresh_rows(app: &App, hwnd: HWND) -> bool {
         && cur
             .iter()
             .zip(rows.iter())
-            .all(|(a, b)| a.title == b.title && a.mtime == b.mtime);
+            .all(|(a, b)| {
+                a.title == b.title
+                    && a.mtime == b.mtime
+                    && a.meta == b.meta
+                    && a.outgoing == b.outgoing
+            });
     if same {
         return false;
     }
