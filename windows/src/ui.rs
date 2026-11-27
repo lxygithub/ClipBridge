@@ -884,8 +884,8 @@ fn peer_chips(app: &App, width: i32) -> Vec<(Option<String>, String, RECT)> {
     for p in peers.iter() {
         let label = if p.name.is_empty() {
             format!("{}…", &p.id[..8.min(p.id.len())])
-        } else if p.name.chars().count() > 10 {
-            format!("{}…", p.name.chars().take(10).collect::<String>())
+        } else if p.name.chars().count() > 14 {
+            format!("{}…", p.name.chars().take(14).collect::<String>())
         } else {
             p.name.clone()
         };
@@ -1098,7 +1098,15 @@ unsafe fn draw_main(hdc: HDC, app: &App, w: i32, h: i32) {
     let (sub_text, sub_color) = {
         let connected = app.link.lock().unwrap().connected;
         if connected {
-            (format!("已连接 · {}", app.peer_label()), C_DIM)
+            // 一行状态写的是「现在有几台在用」，不是发送目标：选定了某一台时，
+            // 这一行如果只写一个名字，看着就像「只连上了一台」，所以两台以上报台数。
+            let online = app.peer_slots().len();
+            let who = if online >= 2 {
+                format!("{online} 台在线")
+            } else {
+                app.peer_label()
+            };
+            (format!("已连接 · {who}"), C_DIM)
         } else {
             ("未连接（手机连上后自动显示设备名）".to_string(), C_FAINT)
         }
