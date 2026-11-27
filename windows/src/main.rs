@@ -7,7 +7,6 @@
 //!   clipbridge send --peer --relay --text   一次性发一段文本
 //!   clipbridge recv --peer --relay          调试用：作为对端接收广播
 
-mod clipboard;
 mod queue;
 mod ui;
 
@@ -28,7 +27,6 @@ use std::path::Path;
 use std::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
-use clipboard::ClipboardWatcher;
 use queue::Store;
 
 #[derive(Parser)]
@@ -327,6 +325,7 @@ fn setup_stdio(dir: &Path, tray: bool) {
         }
         if tray {
             FreeConsole();
+            rotate_log(&dir.join("serve.log"));
             rebind_std(dir.join("serve.log").as_os_str(), true);
             return;
         }
@@ -334,16 +333,29 @@ fn setup_stdio(dir: &Path, tray: bool) {
             rebind_std(OsStr::new("CONOUT$"), false);
             return;
         }
+        rotate_log(&dir.join("serve.log"));
         rebind_std(dir.join("serve.log").as_os_str(), true);
     }
 }
+
+/// 日志轮转：超过 5MB 就把当前日志挪成 `.1`（只留一份，够定位最近的问题）。
+#[cfg(windows)]
+fn rotate_log(path: &Path) {
+    let too_big = std::fs::metadata(path).map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false);
+    if too_big {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+}
+
+#[cfg(not(windows))]
+fn rotate_log(_path: &Path) {}
 
 #[cfg(not(windows))]
 fn setup_stdio(_dir: &Path, _tray: bool) {}
 
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOptions) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
-    let app = Arc::new(ui::App::new(Arc::clone(&store)));
+    let app = Arc::new(ui::App::new(Arc::clone(&store), &dir));
 
     // 输出出口已经在 main 里的 setup_stdio 定好了（脱离控制台 / 落 serve.log / 贴终端）
 
@@ -419,16 +431,44 @@ async fn serve_net(
     );
     println!("LISTENING");
 
-    // 剪贴板 → 入队 → 历史 → 广播
+    // 不再实时监听剪贴板：只有用户在窗口里粘贴 / 拖入文件才发。
+    // ui 侧通过 App::send_text 把文本送进来，和真正的广播逻辑共用一条通道。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    app.set_sender(tx.clone());
+
+    // 链路状态：每 2 秒看一眼选中路径，算出「直连 / 中继 + RTT」喂给标题栏那枚徽标。
+    // 打洞成功时 iroh 会新增一条 IP 路径并切过去，relay 退成兜底，所以看 is_selected()。
     {
+        let peers = Arc::clone(&peers);
         let app = Arc::clone(&app);
-        ClipboardWatcher::new().spawn_poll(move |text| {
-            if app.paused.load(Ordering::Relaxed) {
-                return;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                let conns: Vec<Connection> = peers.lock().await.values().cloned().collect();
+                let mut info = ui::LinkInfo::default();
+                if let Some(conn) = conns.iter().find(|c| c.close_reason().is_none()) {
+                    info.connected = true;
+                    let paths = conn.paths();
+                    let mut selected = None;
+                    let mut any = None;
+                    for p in paths.iter() {
+                        let pair = (p.is_ip(), p.rtt().as_millis() as u64);
+                        if p.is_selected() {
+                            selected = Some(pair);
+                        }
+                        if any.is_none() {
+                            any = Some(pair);
+                        }
+                    }
+                    if let Some((direct, rtt_ms)) = selected.or(any) {
+                        info.direct = direct;
+                        info.rtt_ms = rtt_ms;
+                    }
+                }
+                app.set_link(info);
             }
-            let _ = tx.send(text);
-        })?;
+        });
     }
 
     {
