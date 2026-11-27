@@ -112,8 +112,9 @@ fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    // 先定输出出口再谈别的：GUI 子系统下没有控制台，println 写失败会 panic
-    setup_stdio(&cli.dir, matches!(&cli.cmd, Cmd::Serve { headless: true, .. }));
+    // 先定输出出口再谈别的：GUI 子系统下没有控制台，println 写失败会 panic。
+    // 只有"托盘模式"要脱离控制台，其余命令/headless 都贴着父终端打印。
+    setup_stdio(&cli.dir, matches!(&cli.cmd, Cmd::Serve { headless: false, .. }));
     let key_path = cli.dir.join("endpoint.key");
     let secret = net::load_or_create_secret(&key_path)?;
 
@@ -297,13 +298,14 @@ unsafe fn rebind_std(name: &std::ffi::OsStr, append: bool) {
 ///
 /// 代价是没有控制台，而 `println!` 写失败会 panic，所以要先决定输出去哪：
 /// - 已经被重定向到文件/管道（父进程给的句柄有效）：保持原样，别动
-/// - headless 且从终端启动：附着父控制台，日志照常打在终端里
-/// - 其余（托盘双击、开机自启、`serve` 非 headless）：脱离控制台 + 追加写 `<dir>/serve.log`
+/// - 托盘（`serve` 不带 --headless）：脱离控制台 + 追加写 `<dir>/serve.log`
+/// - 其它（info/send 这类一次性命令、headless 调试）：贴父控制台打日志，
+///   贴不上（比如被计划任务拉起）才落 `serve.log`
 ///
 /// 托盘模式必须脱离，否则那个挂在进程上的控制台窗口一关，Windows 会发
 /// CTRL_CLOSE_EVENT 把整个托盘带走。
 #[cfg(windows)]
-fn setup_stdio(dir: &Path, headless: bool) {
+fn setup_stdio(dir: &Path, tray: bool) {
     use std::ffi::OsStr;
     use windows_sys::Win32::System::Console::{
         AttachConsole, FreeConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
@@ -314,7 +316,7 @@ fn setup_stdio(dir: &Path, headless: bool) {
         if !std_handle.is_null() && std_handle as isize != -1 {
             return;
         }
-        if !headless {
+        if tray {
             FreeConsole();
             rebind_std(dir.join("serve.log").as_os_str(), true);
             return;
@@ -328,7 +330,7 @@ fn setup_stdio(dir: &Path, headless: bool) {
 }
 
 #[cfg(not(windows))]
-fn setup_stdio(_dir: &Path, _headless: bool) {}
+fn setup_stdio(_dir: &Path, _tray: bool) {}
 
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOptions) -> Result<()> {
     let store = Arc::new(Store::open(dir.join("store"))?);
