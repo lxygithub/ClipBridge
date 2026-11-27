@@ -385,32 +385,36 @@ fn rotate_log(_path: &Path) {}
 fn setup_stdio(_dir: &Path, _tray: bool) {}
 
 fn serve(dir: PathBuf, secret: iroh::SecretKey, headless: bool, opts: net::NetOptions) -> Result<()> {
-    // 单实例：第二个进程既抢不到 4242（会静默退化成「只有窗口、没有连接」的空壳，
-    // 界面上永远显示「未连接」），又会往同一份 serve.log 里写。这里用内核命名互斥量挡住。
-    if !take_single_instance("ClipBridge-Serve") {
-        eprintln!("[serve] 已有实例在运行（托盘里那个），本次退出");
-        unsafe {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
-            MessageBoxW(
-                std::ptr::null_mut(),
-                wide("ClipBridge 已经在运行，请看系统托盘里的图标。\n请不要重复启动第二个实例。").as_ptr(),
-                wide("ClipBridge").as_ptr(),
-                MB_OK | MB_ICONINFORMATION,
-            );
-        }
-        return Ok(());
-    }
-
-    let store = Arc::new(Store::open(dir.join("store"))?);
-    let app = Arc::new(ui::App::new(Arc::clone(&store), &dir));
-
-    // 日志第一行带 pid：同时开过好几个实例时，一眼能看出这条日志是哪个进程写的
+    // 日志第一行带 pid：同时开过好几个实例时，一眼能看出这条日志是哪个进程写的。
+    // 放在单实例检查之前，故意让「第二个实例被挡住」也留痕。
     println!(
         "[boot] pid={} version={} headless={}",
         std::process::id(),
         env!("CARGO_PKG_VERSION"),
         headless
     );
+
+    // 单实例：第二个进程既抢不到 4242（会静默退化成「只有窗口、没有连接」的空壳，
+    // 界面上永远显示「未连接」），又会往同一份 serve.log 里写。这里用内核命名互斥量挡住。
+    if !take_single_instance("ClipBridge-Serve") {
+        eprintln!("[serve] 已有实例在运行（托盘里那个），本次退出");
+        unsafe {
+            // 别再弹模态框：从资源管理器启动时没人点「确定」的话进程会一直挂在那儿，
+            // 一个窗口都不建、日志一行不写，看起来就像「启动失败」。直接把老实例的窗口顶上来。
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                FindWindowW, SetForegroundWindow, ShowWindow, SW_SHOWNORMAL,
+            };
+            let hwnd = FindWindowW(wide("ClipBridgeWnd").as_ptr(), std::ptr::null());
+            if !hwnd.is_null() {
+                ShowWindow(hwnd, SW_SHOWNORMAL);
+                SetForegroundWindow(hwnd);
+            }
+        }
+        return Ok(());
+    }
+
+    let store = Arc::new(Store::open(dir.join("store"))?);
+    let app = Arc::new(ui::App::new(Arc::clone(&store), &dir));
 
     // 输出出口已经在 main 里的 setup_stdio 定好了（脱离控制台 / 落 serve.log / 贴终端）
 

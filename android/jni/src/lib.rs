@@ -272,9 +272,11 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
         }
     });
 
-    // 心跳：每 20s 探一次活。QUIC 层现在自己带 3s keepalive + 60s idle，
-    // 这里只负责把「状态」及时反映到 UI，**不再主动关连接**：半开检测反而杀好连接。
-    let mut hb = tokio::time::interval(std::time::Duration::from_secs(20));
+    // 心跳：每 10s 探一次活，靠电脑端把 PING 原样回回来判断链路是否真的活着。
+    // 这一步不能省：电脑端进程被关掉（或换了新实例）时，这条 QUIC 连接会变成半开，
+    // 手机侧读流不会立刻报错，UI 就一直显示「已连接」，而电脑端早就不认识这条连接了
+    // —— 用户看到的就是「手机说连着、电脑说没连」。
+    let mut hb = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut hb_fails = 0u32;
     loop {
         let pair = tokio::select! {
@@ -285,20 +287,32 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                 {
                     continue;
                 }
-                let probe = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    let (mut s, _r) = conn.open_bi().await?;
+                let probe = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                    let (mut s, mut r) = conn.open_bi().await?;
                     protocol::write_frame(&mut s, protocol::MSG_PING, b"").await?;
                     s.finish().ok();
+                    // 电脑端会把 PING 原地回一条，收到才算链路真的通
+                    let got = protocol::read_frame(&mut r).await?;
+                    anyhow::ensure!(
+                        matches!(got, Some((protocol::MSG_PING, _))),
+                        "no ping echo"
+                    );
                     Ok::<(), anyhow::Error>(())
                 })
                 .await;
                 match &probe {
                     Ok(Ok(())) => hb_fails = 0,
-                    _ => hb_fails += 1,
+                    Err(err) => eprintln!("[jni] ping: {err}"),
+                    _ => {}
                 }
-                if hb_fails >= 10 {
-                    eprintln!("[jni] heartbeat failed 10 times, marking stale");
-                    sess.state("stale");
+                if !matches!(&probe, Ok(Ok(()))) {
+                    hb_fails += 1;
+                }
+                if hb_fails >= 3 {
+                    eprintln!("[jni] link dead (3 missed pings), reconnecting");
+                    sess.state("disconnected");
+                    conn.close(0u32.into(), b"link dead");
+                    break;
                 }
                 continue;
             }
