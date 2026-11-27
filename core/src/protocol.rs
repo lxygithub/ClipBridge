@@ -8,6 +8,8 @@ pub const MSG_HELLO: u8 = 0x01;
 pub const MSG_CLIP_TEXT: u8 = 0x02;
 pub const MSG_CLIP_IMAGE_META: u8 = 0x03;
 pub const MSG_CLIP_FILES: u8 = 0x04;
+/// 历史同步：电脑一次把最近若干条文本甩给手机（补发只发 `>last_seq`，手机本地历史空了就永远补不回来）。
+pub const MSG_HISTORY: u8 = 0x06;
 pub const MSG_FILE_OFFER: u8 = 0x10;
 pub const MSG_FILE_ACCEPT: u8 = 0x11;
 pub const MSG_FILE_REJECT: u8 = 0x12;

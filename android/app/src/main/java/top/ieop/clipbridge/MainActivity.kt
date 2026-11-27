@@ -275,7 +275,7 @@ private fun ChannelScreen(
             if (items.isEmpty()) {
                 Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
                     Text(
-                        "通道已建立，还没有条目。\n电脑上复制的东西会落在这里。",
+                        "通道已建立，还没有条目。\n电脑窗口里粘贴或发文件才会到这里；\n连上后会自动拉一次电脑端历史。",
                         color = Palette.faint,
                         fontSize = 12.sp,
                         lineHeight = 22.sp

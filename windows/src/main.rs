@@ -705,6 +705,18 @@ async fn handle_conn(
                         }
                         Err(err) => eprintln!("[replay] {err:#}"),
                     }
+                    // 补发只覆盖 `>last_seq` 的部分。手机重装/清数据后 last_seq 仍是旧的、
+                    // 本地历史却是空的，就会永远停在「通道已建立，还没有条目」。
+                    // 所以每次握手都额外甩一份最近的历史快照，手机端静默合并（不弹通知）。
+                    {
+                        let c = conn2.clone();
+                        let st = Arc::clone(&store);
+                        tokio::spawn(async move {
+                            if let Err(err) = push_history(c, st).await {
+                                eprintln!("[history] {err:#}");
+                            }
+                        });
+                    }
                 }
                 protocol::MSG_CLIP_TEXT => {
                     // "seq|text"，seq=0 表示手机随手上传
@@ -862,6 +874,28 @@ async fn target_conns(peers: &Peers, app: &std::sync::Arc<ui::App>) -> Vec<Conne
         })
         .map(|(_, conn)| conn.clone())
         .collect()
+}
+
+/// 历史快照：最近 200 条文本，`{"items":[[seq,text,mtime],...]}`。
+/// 手机端只用于填时间线，不写剪贴板、不弹通知；文本累计超过 6MB 就截断（帧上限 16MB）。
+async fn push_history(conn: Connection, store: Arc<Store>) -> Result<()> {
+    let all = store.all()?;
+    let start = all.len().saturating_sub(200);
+    let mut arr: Vec<serde_json::Value> = Vec::new();
+    let mut bytes = 0usize;
+    for (seq, text, mtime) in all[start..].iter() {
+        bytes += text.len();
+        if bytes > 6 * 1024 * 1024 {
+            break;
+        }
+        arr.push(serde_json::json!([seq, text, mtime]));
+    }
+    let body = serde_json::json!({ "items": arr }).to_string();
+    let (mut send, _recv) = conn.open_bi().await.context("open history stream")?;
+    protocol::write_frame(&mut send, protocol::MSG_HISTORY, body.as_bytes()).await?;
+    send.finish().ok();
+    println!("[history] sent {} item(s), {} bytes", arr.len(), body.len());
+    Ok(())
 }
 
 async fn push_text(conn: Connection, seq: u64, text: &str) -> Result<()> {

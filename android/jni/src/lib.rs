@@ -109,6 +109,19 @@ impl Session {
         );
     }
 
+    fn notify_history(&self, json: &str) {
+        let Ok(mut env) = self.vm.attach_current_thread() else {
+            return;
+        };
+        let Ok(s) = env.new_string(json) else { return };
+        let _ = env.call_method(
+            self.cb.as_obj(),
+            "onHistory",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&JObject::from(s))],
+        );
+    }
+
     fn notify_file(&self, name: &str, path: &str, size: u64) {        let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
@@ -352,6 +365,12 @@ async fn pump_conn(sess: Arc<Session>, conn: Connection) {
                         }
                     }
                     eprintln!("[jni] bad png ({} bytes)", png.len());
+                    let _ = send.finish();
+                }
+                protocol::MSG_HISTORY => {
+                    // 电脑握手后甩来的历史快照：整包交给 Kotlin 静默合并，不弹通知
+                    let body = String::from_utf8_lossy(&payload).to_string();
+                    sess.notify_history(&body);
                     let _ = send.finish();
                 }
                 protocol::MSG_PING => {

@@ -41,6 +41,7 @@ Android (SyncService + Rust core .so)  ──iroh/QUIC──►  Windows (clipbr
 - **控制面**：一条常驻双向流，帧格式 `[type u8][len u32 LE][payload]`
   - `HELLO 0x01`：`v1|<last_seq>|<device_name>` —— 手机用它补发 + 报名字；电脑连上后反向发 `v1|0|<COMPUTERNAME>` 让手机显示电脑名
   - `CLIP_TEXT 0x02`：`<seq>|<text>`；`CLIP_IMAGE 0x03`：`<seq>|<PNG 原始字节>`（不套 base64，单帧上限 16MB，两端发送前压到 12MB 内）
+  - `HISTORY 0x06`：电脑握手后甩一份最近 200 条文本快照 `{"items":[[seq,text,mtime],...]}`，手机静默合并进时间线（补发只发 `>last_seq`，本地历史空了会永远补不回来）
   - `ACK 0x20` / `PING 0x21`
   - `FILE_OFFER 0x10` / `ACCEPT 0x11` / `REJECT 0x12` / `COMPLETE 0x13` / `PAUSE 0x14` / `RESUME 0x15` / `CANCEL 0x16` / `DATA 0x17`
 - **发现**：`presets::N0`（`dns.iroh.link`），只凭 `EndpointId` 就能连；relay 区域会变，不写死

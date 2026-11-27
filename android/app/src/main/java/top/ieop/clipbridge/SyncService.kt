@@ -119,6 +119,23 @@ class SyncService : Service(), BridgeListener {
         Notifier.showText(this, seq, "图片 ${w}×${h} · 已存到手机")
     }
 
+    /** 历史快照：只填时间线，不通知（否则一次补 20 条会炸一堆通知）。 */
+    override fun onHistory(json: String) {
+        val obj = runCatching { org.json.JSONObject(json) }.getOrNull() ?: return
+        val rows = obj.optJSONArray("items") ?: return
+        val list = ArrayList<ClipItem>(rows.length())
+        for (i in 0 until rows.length()) {
+            val row = runCatching { rows.getJSONArray(i) }.getOrNull() ?: continue
+            list += ClipItem(
+                seq = row.getLong(0),
+                text = row.getString(1),
+                // 电脑侧给的是秒级 mtime
+                ts = row.optLong(2, 0L) * 1000L
+            )
+        }
+        BridgeState.pushHistory(list)
+    }
+
     override fun onFileProgress(name: String, done: Long, total: Long) {
         // total == 0 是「被取消」的约定信号
         if (total <= 0) Notifier.showFileCanceled(this, name)

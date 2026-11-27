@@ -110,6 +110,29 @@ object BridgeState {
         persist()
     }
 
+    /**
+     * 历史快照合并：按 seq 覆盖，按时间倒序排。
+     * 这是「手机本地历史为空但 last_seq 已经很靠前」的兜底——不这样做时间线会一直空着。
+     */
+    fun pushHistory(list: List<ClipItem>) {
+        if (list.isEmpty()) return
+        val merged = LinkedHashMap<Long, ClipItem>()
+        for (it in items.value) {
+            if (it.seq > 0) merged[it.seq] = it
+        }
+        for (it in list) {
+            // 文本以电脑侧为准（本地那条可能是没落盘的半截）
+            merged[it.seq] = it
+        }
+        val localOnly = items.value.filter { it.seq <= 0L || it.imagePath != null }
+        val sorted = (merged.values + localOnly)
+            .sortedByDescending { it.ts }
+            .take(200)
+        items.value = sorted
+        lastSeq.value = maxOf(lastSeq.value, list.maxOf { it.seq })
+        persist()
+    }
+
     fun markSent(text: String) {
         push(ClipItem(seq = 0, text = text, outgoing = true, ts = System.currentTimeMillis()))
     }

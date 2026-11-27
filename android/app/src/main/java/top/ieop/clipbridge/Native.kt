@@ -53,6 +53,9 @@ interface BridgeListener {
     /** 电脑发来一张图：PNG 已落在 inbox/，UI 用来显示缩略图。 */
     fun onImage(seq: Long, path: String, w: Long, h: Long) {}
 
+    /** 握手后电脑甩来的历史快照（JSON），静默合并进时间线，不弹通知。 */
+    fun onHistory(json: String) {}
+
     /** 文件接收进度，用于进度通知。 */
     fun onFileProgress(name: String, done: Long, total: Long) {}
 
